@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-echo "=== service-cartographer Setup ==="
+echo "=== oremap Setup ==="
 
 check_command() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -13,39 +13,29 @@ check_command() {
     fi
 }
 
-check_command python3
+check_command cargo
+check_command rustc
 
-PYTHON_VERSION="$(python3 - <<'PY'
-import sys
-print(f"{sys.version_info.major}.{sys.version_info.minor}")
-PY
-)"
-
-case "$PYTHON_VERSION" in
-    3.11|3.12|3.13) ;;
-    *)
-        echo "ERROR: Python 3.11+ is required. Found $PYTHON_VERSION."
-        exit 1
-        ;;
-esac
+if ! cargo fmt --version >/dev/null 2>&1; then
+    echo "ERROR: rustfmt is required. Install it with: rustup component add rustfmt"
+    exit 1
+fi
 
 cd "$PROJECT_DIR"
 
-if [ ! -d ".venv" ]; then
-    python3 -m venv .venv
-fi
+echo "Building..."
+cargo build --locked
 
-# shellcheck disable=SC1091
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e ".[dev]"
+echo "Running tests..."
+cargo test --locked
 
 echo "=== Setup complete ==="
 echo "Running verification..."
-service-cartographer scan \
+REPORT="$(cargo run --quiet --locked -- scan \
     --systemd-scope off \
     --no-cron \
     --repo-root "$PROJECT_DIR" \
     --wrapper-dir "$PROJECT_DIR/scripts" \
-    --format json \
-    | python3 -c 'import json, sys; data=json.load(sys.stdin); print("Scanned {} items".format(data["summary"]["total"]))'
+    --format json)"
+TOTAL="$(printf '%s\n' "$REPORT" | sed -n 's/^    "total": \([0-9][0-9]*\).*/\1/p')"
+echo "Scanned ${TOTAL:-0} items"

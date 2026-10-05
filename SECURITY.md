@@ -10,7 +10,7 @@ Report vulnerabilities through GitHub security advisories or by contacting Greyf
 
 ## Threat Model
 
-`service-cartographer` is a local read-only scanner. It must not start, stop, enable, disable, delete, or modify services. Reports may still describe sensitive local structure, so users should review output before sharing it.
+`oremap` (formerly `service-cartographer`) is a local read-only scanner. It must not start, stop, enable, disable, delete, or modify services. Reports may still describe sensitive local structure, so users should review output before sharing it.
 
 ## Privacy Commitments
 
@@ -18,4 +18,5 @@ Report vulnerabilities through GitHub security advisories or by contacting Greyf
 - Hostname is hidden by default.
 - Home paths are shortened by default.
 - Inline secret-looking command assignments are redacted in cron previews.
+- External tools run only from reviewed absolute paths with a minimal environment; `git status` runs with optional index locks disabled so scans never rewrite repository state.
 

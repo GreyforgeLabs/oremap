@@ -1,0 +1,16 @@
+usage: oremap [-h] [--version]
+              {scan} ...
+
+Inventory local automation surfaces
+and produce a keep/retire matrix.
+
+positional arguments:
+  {scan}
+    scan      scan local services and
+              workflow artifacts
+
+options:
+  -h, --help  show this help message
+              and exit
+  --version   show program's version
+              number and exit

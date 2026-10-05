@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for improving `service-cartographer`.
+Thanks for improving `oremap`.
 
 ## Local Setup
 
@@ -11,18 +11,20 @@ Thanks for improving `service-cartographer`.
 ## Development Checks
 
 ```bash
-ruff check src/service_cartographer/*.py tests/*.py
-pytest
-service-cartographer scan --systemd-scope off --no-cron --repo-root . --format json
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --locked
+cargo run -- scan --systemd-scope off --no-cron --repo-root . --format json
 ```
 
 ## Standards
 
 - Keep collectors read-only.
-- Use `subprocess.run()` with argument lists, never shell-form commands.
+- Run external tools with `std::process::Command` and argument vectors, never shell-form commands, and only from the reviewed absolute-path allowlist.
 - Do not emit secret values from env files or cron entries.
+- Keep command-line behavior and report output stable; the golden help text in `tests/golden/` and the differential suite (`tests/differential.rs`) guard it.
 - Add focused tests for new parsing or classification behavior.
-- Keep runtime dependencies at zero unless a dependency removes meaningful risk.
+- Keep runtime dependencies minimal and pinned to exact versions; add one only when it removes meaningful risk or code.
 
 ## Pull Requests
 

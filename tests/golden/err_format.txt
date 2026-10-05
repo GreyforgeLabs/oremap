@@ -1,0 +1,12 @@
+usage: oremap scan [-h] [--format {markdown,json,csv}] [--output OUTPUT]
+                   [--focus FOCUS] [--kind KIND] [--stale-days STALE_DAYS]
+                   [--timeout TIMEOUT] [--show-hostname] [--absolute-paths]
+                   [--repo-root REPO_ROOT] [--repo-depth REPO_DEPTH]
+                   [--wrapper-dir WRAPPER_DIR] [--env-root ENV_ROOT]
+                   [--env-depth ENV_DEPTH] [--include-env-names]
+                   [--systemd-scope {user,system,off}] [--unit-dir UNIT_DIR]
+                   [--no-systemd-discovered] [--no-cron] [--no-env]
+                   [--no-repos] [--no-wrappers]
+                   [--retire-keyword RETIRE_KEYWORD]
+                   [--keep-keyword KEEP_KEYWORD]
+oremap scan: error: argument --format: invalid choice: 'xml' (choose from 'markdown', 'json', 'csv')

@@ -4,12 +4,14 @@
 # Explicit text files
 *.md text diff=markdown
 *.txt text
-*.py text diff=python
+*.rs text diff=rust
 *.json text
 *.yml text
 *.yaml text
 *.toml text
 *.sh text eol=lf
+tests/golden/*.txt text eol=lf
+Cargo.lock text eol=lf
 
 # Binary files
 *.png binary
@@ -17,3 +19,4 @@
 *.gif binary
 *.ico binary
 *.woff2 binary
+*.webp binary

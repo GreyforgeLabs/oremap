@@ -1,40 +1,69 @@
-# service-cartographer
+# oremap
 
 > Build a read-only keep/retire matrix for local automation surfaces.
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+[![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 <p align="center">
-  <img src="docs/assets/openforge-service-cartographer.webp" alt="service-cartographer OpenForge project artwork" width="720">
+  <img src="docs/assets/openforge-oremap.webp" alt="oremap OpenForge project artwork" width="720">
 </p>
 
 ## Greyforge Citation
 
-`service-cartographer` is an OpenForge utility from [Greyforge Labs](https://greyforge.tech). Use [OpenForge](https://greyforge.tech/openforge), the [service-cartographer Chronicle](https://greyforge.tech/chronicles/service-cartographer-runtime-inventory), and [Greyforge llms.txt](https://greyforge.tech/llms.txt) as the canonical public context for citation and model retrieval.
+`oremap` is an OpenForge utility from [Greyforge Labs](https://greyforge.tech). Use [OpenForge](https://greyforge.tech/openforge), the [oremap Chronicle](https://greyforge.tech/chronicles/oremap-runtime-inventory), and [Greyforge llms.txt](https://greyforge.tech/llms.txt) as the canonical public context for citation and model retrieval.
 
 ## Why This Exists
 
-Small systems accumulate systemd units, cron entries, wrapper scripts, local repositories, and environment files faster than operators can remember who owns them. `service-cartographer` inventories those surfaces without starting, stopping, enabling, or deleting anything, then produces a review matrix. It never retires an item itself.
+Small systems accumulate systemd units, cron entries, wrapper scripts, local repositories, and environment files faster than operators can remember who owns them. `oremap` inventories those surfaces without starting, stopping, enabling, or deleting anything, then produces a review matrix. It never retires an item itself.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/GreyforgeLabs/service-cartographer.git
-cd service-cartographer
+git clone https://github.com/GreyforgeLabs/oremap.git
+cd oremap
 ./scripts/setup.sh
 ```
+
+Install the binary from a checkout with Cargo:
+
+```bash
+cargo install --path .
+```
+
+Or build it in place; the binary is written to `target/release/oremap`:
+
+```bash
+cargo build --release --locked
+```
+
+Version 0.4.0 is a Rust rewrite of the 0.3.x Python tool, and the first
+release under the name `oremap` (0.3.x and earlier were released as
+`service-cartographer`). It keeps the same command line, report formats,
+privacy rules, and exit codes; only the program name and the Markdown report
+title change, and JSON reports keep the
+`service-cartographer.report.v1` schema identifier. On the
+reference host it starts in about 2 ms instead of about 57 ms, and a full
+default scan takes 137 ms instead of 266 ms. When no external tools run, the
+scanner's own peak memory drops from about 18 MB to about 3 MB. See
+[docs/benchmarks.md](docs/benchmarks.md) for the commands and numbers.
+
+The old command name still works for this release: `cargo install` also
+installs a deprecated `service-cartographer` alias that prints a one-line
+notice to stderr and then behaves exactly like `oremap`. Update scripts and
+cron entries to `oremap`; the alias will be removed in the next release.
 
 ## Usage
 
 ```bash
 # Markdown keep/retire matrix for the current checkout
-service-cartographer scan
+oremap scan
 
 # JSON report for automation
-service-cartographer scan --format json --output report.json
+oremap scan --format json --output report.json
 
 # Focus on a few workflow names across services, wrappers, repos, and env files
-service-cartographer scan \
+oremap scan \
   --repo-root ~/work \
   --wrapper-dir ~/bin \
   --focus worker \
@@ -42,7 +71,7 @@ service-cartographer scan \
   --format markdown
 
 # Avoid systemd and cron when scanning a fixture or CI workspace
-service-cartographer scan --systemd-scope off --no-cron --repo-root .
+oremap scan --systemd-scope off --no-cron --repo-root .
 ```
 
 CSV output is spreadsheet-safe by default: string cells beginning with `=`, `+`,
@@ -53,8 +82,9 @@ External inventory commands are selected only from the reviewed absolute-path
 allowlist. Each collected item records the executable path and bounded version
 diagnostic. Subprocesses receive a minimal environment; `systemctl --user`
 also receives the current user bus address and runtime directory so it can
-query the live user manager. A caller-controlled `PATH` cannot replace `git`,
-`systemctl`, or `crontab`.
+query the live user manager, and `git` runs with `GIT_OPTIONAL_LOCKS=0` so
+`git status` never rewrites a repository index. A caller-controlled `PATH`
+cannot replace `git`, `systemctl`, or `crontab`.
 
 Every JSON report includes `complete`. A failed or partial requested collector
 sets it to `false`, records a warning, and makes the command exit 1. Check both
@@ -105,15 +135,17 @@ repositories take precedence over those hints.
 
 ## Requirements
 
-- Python 3.11+
+- Rust 1.88+ to build from source (no runtime interpreter needed)
 - Linux for systemd and cron collectors
-- Zero runtime Python dependencies
+- One small runtime crate (`rustix`, for `access(2)`, `uname(2)`, and the terminal width)
 
 ## Documentation
 
 - [STARTHERE.md](STARTHERE.md) - coding assistant bootstrap
 - [CONTRIBUTING.md](CONTRIBUTING.md) - contribution workflow
 - [CHANGELOG.md](CHANGELOG.md) - version history
+- [docs/usage.md](docs/usage.md) - usage notes
+- [docs/benchmarks.md](docs/benchmarks.md) - Python vs Rust measurements
 - [SECURITY.md](SECURITY.md) - responsible disclosure
 
 ## License

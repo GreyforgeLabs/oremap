@@ -4,16 +4,11 @@
 *.pem
 *.key
 credentials/
-.venv/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-build/
-dist/
-*.egg-info/
 release/*.local.*
+release/oremap-*.json
+release/oremap-*.md
+# Pre-rename release artifacts (kept so old local files stay ignored)
 release/service-cartographer-*.json
 release/service-cartographer-*.md
 
+/target

@@ -1,5 +1,9 @@
 # Audit remediation evidence
 
+> Historical record for the Python 0.2.0 release. The validation commands
+> below applied to that implementation; the current Rust checks are listed in
+> [CONTRIBUTING.md](CONTRIBUTING.md).
+
 Release: `0.2.0`
 
 Date: 2026-08-28

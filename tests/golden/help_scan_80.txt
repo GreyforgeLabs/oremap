@@ -1,0 +1,40 @@
+usage: oremap scan [-h] [--format {markdown,json,csv}] [--output OUTPUT]
+                   [--focus FOCUS] [--kind KIND] [--stale-days STALE_DAYS]
+                   [--timeout TIMEOUT] [--show-hostname] [--absolute-paths]
+                   [--repo-root REPO_ROOT] [--repo-depth REPO_DEPTH]
+                   [--wrapper-dir WRAPPER_DIR] [--env-root ENV_ROOT]
+                   [--env-depth ENV_DEPTH] [--include-env-names]
+                   [--systemd-scope {user,system,off}] [--unit-dir UNIT_DIR]
+                   [--no-systemd-discovered] [--no-cron] [--no-env]
+                   [--no-repos] [--no-wrappers]
+                   [--retire-keyword RETIRE_KEYWORD]
+                   [--keep-keyword KEEP_KEYWORD]
+
+options:
+  -h, --help            show this help message and exit
+  --format {markdown,json,csv}
+  --output OUTPUT       write output to this path instead of stdout
+  --focus FOCUS         only keep items matching a token
+  --kind KIND           only keep item kinds matching this name
+  --stale-days STALE_DAYS
+  --timeout TIMEOUT     seconds per external command
+  --show-hostname       include the real local hostname
+  --absolute-paths      do not shorten home paths to ~
+  --repo-root REPO_ROOT
+  --repo-depth REPO_DEPTH
+  --wrapper-dir WRAPPER_DIR
+  --env-root ENV_ROOT
+  --env-depth ENV_DEPTH
+  --include-env-names
+  --systemd-scope {user,system,off}
+                        systemd scope to inspect
+  --unit-dir UNIT_DIR
+  --no-systemd-discovered
+                        only report unit files found on disk, not every
+                        systemctl-discovered unit
+  --no-cron
+  --no-env
+  --no-repos
+  --no-wrappers
+  --retire-keyword RETIRE_KEYWORD
+  --keep-keyword KEEP_KEYWORD

@@ -5,7 +5,7 @@
 Use repeated `--focus` flags to reduce a large workstation scan to one workflow family.
 
 ```bash
-service-cartographer scan \
+oremap scan \
   --repo-root ~/work \
   --wrapper-dir ~/bin \
   --focus ingest \
@@ -18,7 +18,7 @@ service-cartographer scan \
 Use this shape in tests, CI, and examples where systemd or cron should not be queried.
 
 ```bash
-service-cartographer scan --systemd-scope off --no-cron --repo-root .
+oremap scan --systemd-scope off --no-cron --repo-root .
 ```
 
 ## Classification Limits

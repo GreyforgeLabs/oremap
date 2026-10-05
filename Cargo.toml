@@ -1,0 +1,36 @@
+[package]
+name = "oremap"
+version = "0.4.0"
+edition = "2024"
+description = "Read-only workflow inventory for services, cron jobs, wrappers, repositories, and environment files"
+license = "AGPL-3.0-only"
+repository = "https://github.com/GreyforgeLabs/oremap"
+homepage = "https://greyforge.tech"
+keywords = ["systemd", "cron", "inventory", "devops", "audit"]
+categories = ["command-line-utilities"]
+rust-version = "1.88"
+default-run = "oremap"
+
+[[bin]]
+name = "oremap"
+path = "src/main.rs"
+
+# Deprecated alias kept for one release so existing scripts and cron entries
+# keep working after the rename; prints a one-line note to stderr.
+[[bin]]
+name = "service-cartographer"
+path = "src/bin/service-cartographer.rs"
+
+[dependencies]
+rustix = { version = "=1.1.4", default-features = false, features = ["std", "fs", "process", "system", "termios"] }
+
+[dev-dependencies]
+assert_cmd = "=2.2.0"
+tempfile = "=3.27.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
