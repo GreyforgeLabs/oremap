@@ -8,7 +8,7 @@
 - `git status` can no longer start a background process: every `git` call passes `-c core.fsmonitor=`, so a repository with `core.fsmonitor=true` no longer makes the scan launch `git fsmonitor--daemon` and write its state under `.git`.
 - Bare repositories are reported with status `bare` instead of a failed `git status` warning, so a scan that finds one is no longer marked incomplete (exit 1).
 - A unit directory that exists but cannot be listed is recorded as an `inventory-error` warning and marks the report incomplete, as wrapper directories already did. It used to be skipped silently.
-- `--include-env-names` never lists text from inside a multi-line quoted value. A line of a quoted PEM block that looked like `BASE64TEXT=` was listed as a variable name.
+- `--include-env-names` never lists text from inside a value. A line of a quoted PEM block that looked like `BASE64TEXT=` was listed as a variable name; lines inside `$'...'` values and lines continued with a trailing backslash are treated as part of the value too.
 - `export NAME=value` lines (the usual `.envrc` form) count as variables.
 - Cron command previews end at the first unescaped `%`. Cron feeds the rest of the line to the command's standard input, so it is shown as `%<redacted>`.
 - Markdown reports write line breaks inside a cell or warning as `\n` and `\r`. A file name containing a line break split its table row in two.
@@ -21,7 +21,7 @@
 
 ### Added
 
-- `scripts/build-release.sh` builds the release binaries and a reproducible `dist/oremap-<version>-<target>.tar.gz` with a SHA-256 checksum file.
+- `scripts/build-release.sh` builds the release binaries and a reproducible `dist/oremap-<version>-<target>.tar.gz` with a SHA-256 checksum file. Build paths are remapped, so the archive is the same from any checkout location and the binaries name no local user.
 
 ## 0.4.0 - 2026-10-05
 

@@ -23,7 +23,23 @@ fi
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || echo 0)}"
 export SOURCE_DATE_EPOCH
 
+# Build paths (the project and cargo's registry under the builder's home)
+# would otherwise be embedded in panic locations: remap them so the binary
+# depends only on the commit and toolchain, and names no local user.
+CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$CARGO_HOME_DIR=/cargo"$'\x1f'"--remap-path-prefix=$PROJECT_DIR=/oremap"
+export CARGO_ENCODED_RUSTFLAGS
+
 cargo build --release --locked "$@"
+
+for binary in target/release/oremap target/release/service-cartographer; do
+    for prefix in "$CARGO_HOME_DIR" "$PROJECT_DIR"; do
+        if grep -qaF -- "$prefix" "$binary"; then
+            echo "ERROR: $binary embeds the build path $prefix." >&2
+            exit 1
+        fi
+    done
+done
 
 reported="$(target/release/oremap --version)"
 if [ "$reported" != "oremap $VERSION" ]; then
@@ -35,6 +51,7 @@ NAME="oremap-$VERSION-$TARGET"
 STAGE="dist/$NAME"
 rm -rf "$STAGE" "dist/$NAME.tar.gz" "dist/$NAME.tar.gz.sha256"
 mkdir -p "$STAGE"
+chmod 0755 "$STAGE"
 # The deprecated `service-cartographer` alias ships while Cargo.toml builds it.
 install -m 0755 target/release/oremap target/release/service-cartographer "$STAGE/"
 install -m 0644 README.md CHANGELOG.md LICENSE "$STAGE/"

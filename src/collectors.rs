@@ -1438,13 +1438,14 @@ fn env_assignment(line: &str) -> Option<(&str, &str)> {
 }
 
 /// Byte offset just past the quote that closes a value opened with
-/// `quote`; a backslash escapes the next character inside double quotes.
-fn closing_quote(text: &str, quote: char) -> Option<usize> {
+/// `quote`; with `escapes` (double quotes and `$'...'`), a backslash escapes
+/// the next character.
+fn closing_quote(text: &str, quote: char, escapes: bool) -> Option<usize> {
     let mut escaped = false;
     for (index, c) in text.char_indices() {
         if escaped {
             escaped = false;
-        } else if c == '\\' && quote == '"' {
+        } else if c == '\\' && escapes {
             escaped = true;
         } else if c == quote {
             return Some(index + c.len_utf8());
@@ -1453,15 +1454,27 @@ fn closing_quote(text: &str, quote: char) -> Option<usize> {
     None
 }
 
-/// Names assigned in env-file text. Lines inside a quoted value that spans
-/// several lines belong to that value, so they are never read as names (a
-/// PEM block, for example, has lines that look like `BASE64=`).
+/// Whether a line ends in an unescaped backslash, which continues it
+/// (shell syntax, as used by `.envrc`).
+fn continues_line(line: &str) -> bool {
+    line.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 1
+}
+
+/// Names assigned in env-file text. Lines that belong to a value (inside a
+/// quoted value that spans several lines, or after a backslash line
+/// continuation) are never read as names: a PEM block, for example, has
+/// lines that look like `BASE64=`.
 fn env_names_in(text: &str) -> Vec<String> {
     let mut names = Vec::new();
-    let mut open_quote: Option<char> = None;
+    let mut open_quote: Option<(char, bool)> = None;
+    let mut continued = false;
     for line in splitlines(text).into_iter().take(MAX_ENV_LINES) {
-        if let Some(quote) = open_quote {
-            if closing_quote(line, quote).is_some() {
+        if continued {
+            continued = continues_line(line);
+            continue;
+        }
+        if let Some((quote, escapes)) = open_quote {
+            if closing_quote(line, quote, escapes).is_some() {
                 open_quote = None;
             }
             continue;
@@ -1471,10 +1484,22 @@ fn env_names_in(text: &str) -> Vec<String> {
         };
         names.push(name.to_string());
         let value = value.trim_start_matches([' ', '\t']);
-        if let Some(quote) = value.chars().next().filter(|c| matches!(c, '"' | '\''))
-            && closing_quote(&value[1..], quote).is_none()
-        {
-            open_quote = Some(quote);
+        let quoted = if let Some(rest) = value.strip_prefix("$'") {
+            Some(('\'', true, rest))
+        } else {
+            match value.chars().next() {
+                Some('"') => Some(('"', true, &value[1..])),
+                Some('\'') => Some(('\'', false, &value[1..])),
+                _ => None,
+            }
+        };
+        match quoted {
+            Some((quote, escapes, rest)) => {
+                if closing_quote(rest, quote, escapes).is_none() {
+                    open_quote = Some((quote, escapes));
+                }
+            }
+            None => continued = continues_line(value),
         }
     }
     names.sort();
@@ -2032,17 +2057,30 @@ mod tests {
             "SAME_LINE=\"closed\" ok\n",
             "EMPTY=\"\"\n",
             "LAST=2\n",
+            "CONT=part one \\\n",
+            "IN_CONT=x \\\n",
+            "STILL_IN_CONT=y\n",
+            "AFTER_CONT=3\n",
+            "TWO_BACKSLASHES=a\\\\\n",
+            "ANSI=$'line \\' one\n",
+            "IN_ANSI=z'\n",
+            "END=4\n",
         );
         assert_eq!(
             env_names_in(text),
             [
                 "AFTER",
+                "AFTER_CONT",
+                "ANSI",
+                "CONT",
                 "EMPTY",
+                "END",
                 "ESC",
                 "KEY",
                 "LAST",
                 "SAME_LINE",
-                "SINGLE"
+                "SINGLE",
+                "TWO_BACKSLASHES"
             ]
         );
     }
