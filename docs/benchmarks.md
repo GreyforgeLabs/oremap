@@ -83,3 +83,41 @@ is CPython 3.14: `libpython3.14.so` alone is 6.36 MB, and the standard
 library under `/usr/lib/python3.14`, not counting `site-packages`, is 68.8 MB. The Rust binary is
 self-contained: its only dynamic dependencies are the system C runtime
 (`libc.so.6` and `libgcc_s.so.1`), and it runs on hosts without Python.
+
+## 0.4.0 vs 0.4.1
+
+Measured on 2026-10-14 on the same host with a 1-minute load average of
+about 17 to 21, so small differences are noise. Both binaries were built
+with `cargo build --release --locked`. Each run forks, execs, and waits for
+the binary, timing it with `CLOCK_MONOTONIC` and reading `ru_maxrss` from
+`wait4`. The two binaries alternate run by run (2 warm-up runs, then 21
+timed runs each). Each figure is the median of three such rounds' medians.
+Process counts come from an `LD_PRELOAD` shim that logs every
+`posix_spawn` and `fork` call.
+
+| Command | 0.4.0 | 0.4.1 | Change |
+|---|---:|---:|---:|
+| `--version` | 1.73 ms | 1.52 ms | noise |
+| Filesystem-only scan (1) | 4.58 ms | 4.35 ms | noise |
+| Default scan (2) | 195.5 ms | 196.7 ms | noise (3) |
+| 64 repositories (4) | 316.1 ms | 253.8 ms | 1.25x |
+| Env-file walk, about 26,000 directories (5) | 200.4 ms | 182.9 ms | 1.10x |
+| Repository discovery in `/usr/share` (6) | 328.3 ms | 162.9 ms | 2.0x |
+
+| Processes started | 0.4.0 | 0.4.1 |
+|---|---:|---:|
+| Default scan (2), 6 repositories | 22 | 16 |
+| 64 repositories (4) | 193 | 129 |
+
+Peak RSS is unchanged: about 2.7 MB for `--version` and 6.1 MB for the
+default scan, where `systemctl` sets the peak. The stripped release binary
+is 851,240 bytes (852,144 for 0.4.0).
+
+1. As above.
+2. As above. This host has 437 units, 93 wrappers and 6 repositories.
+3. `systemctl --user list-unit-files` alone takes about 190 ms here; the
+   scan waits for it, so the default scan cannot finish sooner.
+4. `scan --format json --systemd-scope off --no-cron --no-env --no-wrappers --repo-root ~/Work/workspaces --repo-depth 2`.
+5. `scan --format json --systemd-scope off --no-cron --no-repos --no-wrappers --env-root ~/Work --env-depth 4`.
+6. `scan --format json --systemd-scope off --no-cron --no-env --no-wrappers --repo-root /usr/share --repo-depth 6`
+   walks about 9,000 directories that hold 46,000 symlinks and no repositories.

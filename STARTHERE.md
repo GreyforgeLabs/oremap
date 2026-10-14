@@ -35,6 +35,7 @@ tests/
   differential.rs comparison against the Python reference (opt-in)
   golden/         reference help and error text
 scripts/setup.sh  idempotent setup and verification
+scripts/build-release.sh  reproducible release archive and checksum
 ```
 
 ## Setup Prerequisites
@@ -91,6 +92,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 # Build a release binary
 cargo build --release --locked
+
+# Build the release archive and checksum (dist/)
+./scripts/build-release.sh
 
 # Local Markdown report
 cargo run --release -- scan --format markdown --output report.md

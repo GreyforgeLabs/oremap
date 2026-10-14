@@ -12,3 +12,4 @@ release/service-cartographer-*.json
 release/service-cartographer-*.md
 
 /target
+/dist

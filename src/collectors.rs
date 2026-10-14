@@ -134,15 +134,16 @@ fn same_file_identity(left: &FsMetadata, right: &FsMetadata) -> bool {
     (left.dev(), left.ino(), left.mode()) == (right.dev(), right.ino(), right.mode())
 }
 
+fn metadata_mtime_iso(metadata: &FsMetadata) -> String {
+    isoformat_utc(mtime_micros(metadata.mtime(), metadata.mtime_nsec())).unwrap_or_default()
+}
+
 fn mtime_iso(path: &Path) -> String {
     // Python raised on errors other than FileNotFoundError; an empty value
     // keeps the scan going instead (documented in CHANGELOG 0.4.0).
-    match fs::metadata(path) {
-        Ok(metadata) => {
-            isoformat_utc(mtime_micros(metadata.mtime(), metadata.mtime_nsec())).unwrap_or_default()
-        }
-        Err(_) => String::new(),
-    }
+    fs::metadata(path)
+        .map(|metadata| metadata_mtime_iso(&metadata))
+        .unwrap_or_default()
 }
 
 fn open_no_follow(path: &Path) -> io::Result<File> {
@@ -536,9 +537,19 @@ pub fn parse_systemctl_unit_files(output: &str) -> Vec<(String, String)> {
 }
 
 /// Parse `systemctl list-units --all --no-legend` output into name -> active.
+///
+/// `systemctl` puts a status marker (`●`, or `*` in the C locale) in front
+/// of failed, activating, and not-found units; it is skipped so those units
+/// keep their state.
 pub fn parse_systemctl_units(output: &str) -> Vec<(String, String)> {
     ordered_pairs(splitlines(output).into_iter().filter_map(|line| {
-        let parts = pyfmt::split(line);
+        let mut parts = pyfmt::split(line);
+        if parts
+            .first()
+            .is_some_and(|first| first.chars().all(|c| !c.is_alphanumeric() && c != '.'))
+        {
+            parts.remove(0);
+        }
         (parts.len() >= 4 && parts[0].contains('.'))
             .then(|| (parts[0].to_string(), parts[2].to_string()))
     }))
@@ -551,34 +562,60 @@ fn unit_suffix(name: &str) -> &str {
     }
 }
 
-fn unit_files(dir_spelling: &str, scope: &str) -> Vec<InventoryItem> {
-    let Ok(expanded) = paths::expanduser(dir_spelling) else {
-        return Vec::new();
-    };
-    let directory = paths::to_path(&expanded);
-    if fs::metadata(&directory).is_err() {
-        return Vec::new();
+/// One explicitly requested directory (a unit or wrapper directory) and its
+/// entry names, sorted by display spelling and then by raw bytes.
+struct ListedDir {
+    spelling: String,
+    path: PathBuf,
+    names: Vec<(String, OsString)>,
+}
+
+/// List an explicit directory. A missing path or a non-directory is skipped;
+/// a directory that exists but cannot be listed is recorded as an
+/// `inventory-error` warning, so the report is marked incomplete.
+fn list_explicit_dir(spelling: &str, warnings: &mut Vec<String>) -> Option<ListedDir> {
+    let expanded = paths::expanduser(spelling).ok()?;
+    let path = paths::to_path(&expanded);
+    if !fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+        return None;
     }
-    let Ok(entries) = fs::read_dir(&directory) else {
-        return Vec::new();
+    let listed = fs::read_dir(&path).and_then(|entries| {
+        entries
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<OsString>>>()
+    });
+    let names = match listed {
+        Ok(names) => names,
+        Err(error) => {
+            record_inventory_error(warnings, &expanded, &error);
+            return None;
+        }
     };
-    let mut names: Vec<(String, OsString)> = entries
-        .filter_map(Result::ok)
-        .map(|entry| {
-            let raw = entry.file_name();
-            (raw.to_string_lossy().into_owned(), raw)
-        })
-        .filter(|(name, _)| name.contains('.') && UNIT_SUFFIXES.contains(&unit_suffix(name)))
+    let mut names: Vec<(String, OsString)> = names
+        .into_iter()
+        .map(|name| (name.to_string_lossy().into_owned(), name))
         .collect();
     names.sort();
-    names
+    Some(ListedDir {
+        spelling: expanded,
+        path,
+        names,
+    })
+}
+
+fn unit_files(dir_spelling: &str, scope: &str, warnings: &mut Vec<String>) -> Vec<InventoryItem> {
+    let Some(listed) = list_explicit_dir(dir_spelling, warnings) else {
+        return Vec::new();
+    };
+    listed
+        .names
         .into_iter()
+        .filter(|(name, _)| name.contains('.') && UNIT_SUFFIXES.contains(&unit_suffix(name)))
         .map(|(name, raw)| {
-            let path = paths::join(&expanded, &name);
             let mut item = InventoryItem::new("systemd_unit", name);
+            item.path = paths::join(&listed.spelling, &item.name);
             // Stat the real name; the display spelling may contain U+FFFD.
-            item.last_activity = mtime_iso(&directory.join(&raw));
-            item.path = path;
+            item.last_activity = mtime_iso(&listed.path.join(&raw));
             item.metadata = Metadata::from_pairs([("scope", scope), ("source", "unit_file")]);
             item
         })
@@ -630,7 +667,7 @@ pub fn collect_systemd(
     let mut items = UnitMap::default();
     let mut warnings = Vec::new();
     for unit_dir in unit_dirs {
-        for item in unit_files(unit_dir, scope) {
+        for item in unit_files(unit_dir, scope, &mut warnings) {
             items.insert(item);
         }
     }
@@ -752,6 +789,21 @@ fn split_cron_line(line: &str) -> (String, String) {
     ("unknown".to_string(), line.to_string())
 }
 
+/// The command text cron runs. Cron turns the first `%` that is not
+/// escaped as `\\%` into a newline and feeds the rest to the command's
+/// standard input, which often carries message bodies or credentials, so
+/// that part is replaced with `%<redacted>`.
+fn cron_command_text(command: &str) -> String {
+    let stdin_start = command
+        .char_indices()
+        .find(|(index, c)| *c == '%' && !command[..*index].ends_with('\\'))
+        .map(|(index, _)| index);
+    match stdin_start {
+        Some(index) => format!("{}%<redacted>", &command[..index]),
+        None => command.to_string(),
+    }
+}
+
 /// Collect the current user's crontab entries.
 pub fn collect_cron(
     exec: &dyn Exec,
@@ -788,7 +840,7 @@ pub fn collect_cron(
             continue;
         }
         let (schedule, command) = split_cron_line(stripped);
-        let mut preview = redact_command(&command, absolute_paths);
+        let mut preview = redact_command(&cron_command_text(&command), absolute_paths);
         if char_len(&preview) > 160 {
             preview = format!("{}...", take_chars(&preview, 157));
         }
@@ -809,10 +861,28 @@ pub fn collect_cron(
 // wrappers
 // ---------------------------------------------------------------------------
 
+/// `#!` lines longer than this are cut (the kernel reads only 256 bytes).
+const MAX_SHEBANG_BYTES: u64 = 64 * 1024;
+
+/// False once the bytes read so far can no longer begin with `#!` after
+/// invalid UTF-8 is dropped and leading whitespace is stripped.
+fn could_start_shebang(prefix: &[u8]) -> bool {
+    let decoded = pyfmt::decode_ignore(prefix);
+    let mut chars = decoded.trim_start_matches(pyfmt::is_space).chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (None, _) | (Some('#'), None) | (Some('#'), Some('!'))
+    )
+}
+
+/// First line of a wrapper when it is a `#!` line. Reading stops at the
+/// first line break, as soon as the file cannot start with `#!` (binaries
+/// stop after one block), or after [`MAX_SHEBANG_BYTES`].
 fn read_shebang(path: &Path) -> String {
-    let Ok(mut file) = File::open(path) else {
+    let Ok(file) = File::open(path) else {
         return String::new();
     };
+    let mut file = file.take(MAX_SHEBANG_BYTES);
     let mut line = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -830,6 +900,9 @@ fn read_shebang(path: &Path) -> String {
             break;
         }
         line.extend_from_slice(&chunk[..read]);
+        if !could_start_shebang(&line) {
+            return String::new();
+        }
     }
     let decoded = pyfmt::decode_ignore(&line);
     let first = strip(&decoded);
@@ -847,57 +920,26 @@ fn read_shebang(path: &Path) -> String {
 pub fn collect_wrappers(wrapper_dirs: &[String], warnings: &mut Vec<String>) -> Vec<InventoryItem> {
     let mut items = Vec::new();
     for wrapper_dir in wrapper_dirs {
-        let Ok(expanded) = paths::expanduser(wrapper_dir) else {
+        let Some(listed) = list_explicit_dir(wrapper_dir, warnings) else {
             continue;
         };
-        let directory = paths::to_path(&expanded);
-        if !fs::metadata(&directory).is_ok_and(|metadata| metadata.is_dir()) {
-            continue;
-        }
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) => {
-                record_inventory_error(warnings, &expanded, &error);
-                continue;
-            }
-        };
-        let mut names: Vec<OsString> = Vec::new();
-        let mut failed = false;
-        for entry in entries {
-            match entry {
-                Ok(entry) => names.push(entry.file_name()),
-                Err(error) => {
-                    record_inventory_error(warnings, &expanded, &error);
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if failed {
-            continue;
-        }
-        let mut names: Vec<(String, OsString)> = names
-            .into_iter()
-            .map(|name| (name.to_string_lossy().into_owned(), name))
-            .collect();
-        names.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        for (display_name, raw_name) in names {
-            let path = directory.join(&raw_name);
+        for (display_name, raw_name) in listed.names {
+            let path = listed.path.join(&raw_name);
             let Ok(metadata) = fs::metadata(&path) else {
                 continue;
             };
             if !metadata.is_file() || !is_executable(&path) {
                 continue;
             }
-            let mut item = InventoryItem::new("wrapper", display_name.clone());
+            let mut item = InventoryItem::new("wrapper", display_name);
             item.metadata.set("size_bytes", metadata.len().to_string());
             let shebang = read_shebang(&path);
             if !shebang.is_empty() {
                 item.metadata.set("shebang", shebang);
             }
-            item.path = paths::join(&expanded, &display_name);
+            item.path = paths::join(&listed.spelling, &item.name);
             item.status = "executable".into();
-            item.last_activity = mtime_iso(&path);
+            item.last_activity = metadata_mtime_iso(&metadata);
             items.push(item);
         }
     }
@@ -908,9 +950,13 @@ pub fn collect_wrappers(wrapper_dirs: &[String], warnings: &mut Vec<String>) -> 
 // Directory walking (os.walk, topdown, followlinks=False)
 // ---------------------------------------------------------------------------
 
-/// Walk callback: directory, depth, prunable sub-directory names, other names.
+/// Walk callback: directory, depth, prunable sub-directory names, other names
+/// (files, symlinks, and everything else).
 type Visit<'a> = dyn FnMut(&Path, usize, &mut Vec<OsString>, &[OsString]) + 'a;
 
+/// Depth-first, top-down walk that never follows symlinks (`os.walk` with
+/// `followlinks=False`). Entry types come from the directory listing, so a
+/// directory costs one listing and no per-entry `stat`.
 fn walk(top: &Path, on_error: &mut dyn FnMut(&Path, &io::Error), visit: &mut Visit<'_>) {
     let mut stack: Vec<(PathBuf, usize)> = vec![(top.to_path_buf(), 0)];
     while let Some((directory, depth)) = stack.pop() {
@@ -933,14 +979,9 @@ fn walk(top: &Path, on_error: &mut dyn FnMut(&Path, &io::Error), visit: &mut Vis
                     break;
                 }
             };
-            let is_dir = match entry.file_type() {
-                Ok(kind) if kind.is_symlink() => {
-                    fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_dir())
-                }
-                Ok(kind) => kind.is_dir(),
-                Err(_) => false,
-            };
-            if is_dir {
+            // A symlink is never entered, so it is listed with the other
+            // names without following it; both visitors reject symlinks.
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 dirs.push(entry.file_name());
             } else {
                 nondirs.push(entry.file_name());
@@ -951,11 +992,7 @@ fn walk(top: &Path, on_error: &mut dyn FnMut(&Path, &io::Error), visit: &mut Vis
         }
         visit(&directory, depth, &mut dirs, &nondirs);
         for name in dirs.iter().rev() {
-            let child = directory.join(name);
-            let is_link = fs::symlink_metadata(&child).is_ok_and(|m| m.file_type().is_symlink());
-            if !is_link {
-                stack.push((child, depth + 1));
-            }
+            stack.push((directory.join(name), depth + 1));
         }
     }
 }
@@ -1056,6 +1093,18 @@ pub fn find_git_repositories(
     max_depth: i64,
     warnings: &mut Vec<String>,
 ) -> Vec<PathBuf> {
+    discover_git_repositories(repo_roots, max_depth, warnings)
+        .into_iter()
+        .map(|(path, _bare)| path)
+        .collect()
+}
+
+/// [`find_git_repositories`] that also says whether each repository is bare.
+fn discover_git_repositories(
+    repo_roots: &[String],
+    max_depth: i64,
+    warnings: &mut Vec<String>,
+) -> Vec<(PathBuf, bool)> {
     let mut repos = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     for root in repo_roots {
@@ -1072,15 +1121,25 @@ pub fn find_git_repositories(
                     error,
                 )
             },
-            &mut |current, depth, dirnames, _files| {
+            &mut |current, depth, dirnames, files| {
                 let mut sink = warnings_cell.borrow_mut();
-                if has_safe_git_marker(current, &mut sink)
-                    || looks_like_bare_git_repo(current, &mut sink)
-                {
+                // The listing says which marker names exist, so only those
+                // are inspected; a directory without them costs no syscalls.
+                let listed = |name: &[u8], among: &[OsString]| {
+                    among.iter().any(|entry| entry.as_bytes() == name)
+                };
+                let subdirs: &[OsString] = dirnames;
+                let worktree = (listed(b".git", subdirs) || listed(b".git", files))
+                    && has_safe_git_marker(current, &mut sink);
+                let bare = !worktree
+                    && listed(b"HEAD", files)
+                    && listed(b"objects", subdirs)
+                    && looks_like_bare_git_repo(current, &mut sink);
+                if worktree || bare {
                     match fs::canonicalize(current) {
                         Ok(resolved) => {
                             if seen.insert(resolved) {
-                                repos.push(current.to_path_buf());
+                                repos.push((current.to_path_buf(), bare));
                             }
                         }
                         Err(error) => {
@@ -1103,10 +1162,78 @@ pub fn find_git_repositories(
     repos
 }
 
+/// Results of the read-only `git` queries for one repository.
 struct RepoProbe {
-    branch: CommandResult,
-    status: CommandResult,
+    /// `None` when the branch could not be determined (unborn or failed).
+    branch: Option<String>,
+    /// `git status`; `None` for a bare repository, which has no work tree.
+    status: Option<CommandResult>,
     last_commit: CommandResult,
+}
+
+/// Every `git` call disables `core.fsmonitor`: a repository that enables
+/// it would otherwise make `git status` start a background
+/// `fsmonitor--daemon` and write its state under `.git`. The empty value
+/// means "off" in every Git version.
+const GIT_READ_ONLY_CONFIG: [&str; 2] = ["-c", "core.fsmonitor="];
+
+/// Branch from `git status --porcelain=v2 --branch` headers, spelled the
+/// way `git rev-parse --abbrev-ref HEAD` prints it: `HEAD` when detached,
+/// nothing for an unborn branch.
+fn porcelain_v2_branch(output: &str) -> Option<String> {
+    let mut oid = None;
+    let mut head = None;
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("# branch.oid ") {
+            oid = Some(value);
+        } else if let Some(value) = line.strip_prefix("# branch.head ") {
+            head = Some(value);
+        }
+    }
+    match (oid, head) {
+        (Some("(initial)"), _) | (_, None) => None,
+        (_, Some("(detached)")) => Some("HEAD".to_string()),
+        (_, Some(name)) => Some(name.to_string()),
+    }
+}
+
+fn probe_repository(
+    exec: &dyn Exec,
+    git: &str,
+    repo: &Path,
+    bare: bool,
+    timeout: f64,
+) -> RepoProbe {
+    let run = |extra: &[&str]| {
+        let mut args: Vec<OsString> = vec![git.into()];
+        args.extend(GIT_READ_ONLY_CONFIG.iter().map(OsString::from));
+        args.extend(["-C".into(), repo.as_os_str().to_os_string()]);
+        args.extend(extra.iter().map(OsString::from));
+        exec.run(&args, timeout)
+    };
+    let rev_parse_branch = || {
+        let result = run(&["rev-parse", "--abbrev-ref", "HEAD"]);
+        (result.code == 0).then(|| strip(&result.stdout).to_string())
+    };
+    // One `git status` reports both the branch and the changes; the
+    // separate `rev-parse` runs only when there is no work tree or the
+    // status query failed.
+    let (branch, status) = if bare {
+        (rev_parse_branch(), None)
+    } else {
+        let status = run(&["status", "--porcelain=v2", "--branch"]);
+        let branch = if status.code == 0 {
+            porcelain_v2_branch(&status.stdout)
+        } else {
+            rev_parse_branch()
+        };
+        (branch, Some(status))
+    };
+    RepoProbe {
+        branch,
+        status,
+        last_commit: run(&["log", "-1", "--format=%cI"]),
+    }
 }
 
 fn worker_count(jobs: usize) -> usize {
@@ -1115,8 +1242,8 @@ fn worker_count(jobs: usize) -> usize {
 }
 
 /// Find Git repositories under the requested roots and collect lightweight
-/// state with read-only `git rev-parse`, `git status --porcelain`, and
-/// `git log -1`.
+/// state with read-only `git status --porcelain=v2 --branch` and
+/// `git log -1` (plus `git rev-parse` for bare repositories).
 pub fn collect_repositories(
     exec: &dyn Exec,
     repo_roots: &[String],
@@ -1133,11 +1260,10 @@ pub fn collect_repositories(
 
     let (executable_version, repos) = thread::scope(|s| {
         let version = spawn_or_run(s, || exec.probe("git", &git, timeout));
-        let repos = find_git_repositories(repo_roots, max_depth, &mut warnings);
+        let repos = discover_git_repositories(repo_roots, max_depth, &mut warnings);
         (version.join().unwrap_or_default(), repos)
     });
 
-    let displays: Vec<String> = repos.iter().map(|repo| paths::display(repo)).collect();
     let next = AtomicUsize::new(0);
     let mut probes: Vec<Option<RepoProbe>> = (0..repos.len()).map(|_| None).collect();
     let results = std::sync::Mutex::new(&mut probes);
@@ -1147,23 +1273,10 @@ pub fn collect_repositories(
             spawn_or_run(s, || {
                 loop {
                     let index = next.fetch_add(1, Ordering::SeqCst);
-                    let Some(repo) = repos.get(index) else {
+                    let Some((repo, bare)) = repos.get(index) else {
                         break;
                     };
-                    let run = |extra: &[&str]| {
-                        let mut args: Vec<OsString> = vec![
-                            git.clone().into(),
-                            "-C".into(),
-                            repo.clone().into_os_string(),
-                        ];
-                        args.extend(extra.iter().map(OsString::from));
-                        exec.run(&args, timeout)
-                    };
-                    let probe = RepoProbe {
-                        branch: run(&["rev-parse", "--abbrev-ref", "HEAD"]),
-                        status: run(&["status", "--porcelain"]),
-                        last_commit: run(&["log", "-1", "--format=%cI"]),
-                    };
+                    let probe = probe_repository(exec, &git, repo, *bare, timeout);
                     if let Ok(mut guard) = results.lock() {
                         guard[index] = Some(probe);
                     }
@@ -1173,29 +1286,34 @@ pub fn collect_repositories(
     });
 
     let mut items = Vec::new();
-    for ((repo, display), probe) in repos.iter().zip(&displays).zip(probes) {
+    for ((repo, _), probe) in repos.iter().zip(probes) {
         let Some(probe) = probe else { continue };
+        let display = paths::display(repo);
         let mut metadata = Metadata::from_pairs([
             ("executable", git.as_str()),
             ("executable_version", executable_version.as_str()),
         ]);
-        if probe.branch.code == 0 {
-            metadata.set("branch", strip(&probe.branch.stdout));
+        if let Some(branch) = probe.branch {
+            metadata.set("branch", branch);
         }
-        let mut repo_status = "unknown";
-        if probe.status.code == 0 {
-            let dirty = splitlines(&probe.status.stdout)
-                .into_iter()
-                .filter(|line| !strip(line).is_empty())
-                .count();
-            repo_status = if dirty > 0 { "dirty" } else { "clean" };
-            metadata.set("dirty_count", dirty.to_string());
-        } else {
-            warnings.push(format!(
-                "git status failed for {display}: {}",
-                strip(&probe.status.stderr)
-            ));
-        }
+        let repo_status = match &probe.status {
+            None => "bare",
+            Some(status) if status.code == 0 => {
+                let dirty = splitlines(&status.stdout)
+                    .into_iter()
+                    .filter(|line| !line.starts_with('#') && !strip(line).is_empty())
+                    .count();
+                metadata.set("dirty_count", dirty.to_string());
+                if dirty > 0 { "dirty" } else { "clean" }
+            }
+            Some(status) => {
+                warnings.push(format!(
+                    "git status failed for {display}: {}",
+                    strip(&status.stderr)
+                ));
+                "unknown"
+            }
+        };
         let last_activity = if probe.last_commit.code == 0 {
             strip(&probe.last_commit.stdout).to_string()
         } else {
@@ -1206,7 +1324,7 @@ pub fn collect_repositories(
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         let mut item = InventoryItem::new("repository", name);
-        item.path = display.clone();
+        item.path = display;
         item.status = repo_status.to_string();
         item.last_activity = last_activity;
         item.metadata = metadata;
@@ -1293,20 +1411,75 @@ pub fn find_env_files(
     files
 }
 
-fn env_name(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start_matches(pyfmt::is_space);
-    let mut chars = trimmed.char_indices();
-    match chars.next() {
-        Some((_, c)) if c.is_ascii_alphabetic() || c == '_' => {}
+/// The name and value text of one env-file assignment: `NAME=value`,
+/// `NAME = value`, or the shell form `export NAME=value` used by `.envrc`.
+fn env_assignment(line: &str) -> Option<(&str, &str)> {
+    let mut trimmed = line.trim_start_matches(pyfmt::is_space);
+    if let Some(rest) = trimmed
+        .strip_prefix("export")
+        .filter(|rest| rest.starts_with(pyfmt::is_space))
+    {
+        let rest = rest.trim_start_matches(pyfmt::is_space);
+        if !rest.starts_with('=') {
+            trimmed = rest;
+        }
+    }
+    match trimmed.chars().next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
         _ => return None,
     }
     let end = trimmed
-        .char_indices()
-        .skip(1)
-        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_'))
-        .map_or(trimmed.len(), |(index, _)| index);
-    let after = trimmed[end..].trim_start_matches(pyfmt::is_space);
-    after.starts_with('=').then(|| &trimmed[..end])
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(trimmed.len());
+    let value = trimmed[end..]
+        .trim_start_matches(pyfmt::is_space)
+        .strip_prefix('=')?;
+    Some((&trimmed[..end], value))
+}
+
+/// Byte offset just past the quote that closes a value opened with
+/// `quote`; a backslash escapes the next character inside double quotes.
+fn closing_quote(text: &str, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    for (index, c) in text.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' && quote == '"' {
+            escaped = true;
+        } else if c == quote {
+            return Some(index + c.len_utf8());
+        }
+    }
+    None
+}
+
+/// Names assigned in env-file text. Lines inside a quoted value that spans
+/// several lines belong to that value, so they are never read as names (a
+/// PEM block, for example, has lines that look like `BASE64=`).
+fn env_names_in(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut open_quote: Option<char> = None;
+    for line in splitlines(text).into_iter().take(MAX_ENV_LINES) {
+        if let Some(quote) = open_quote {
+            if closing_quote(line, quote).is_some() {
+                open_quote = None;
+            }
+            continue;
+        }
+        let Some((name, value)) = env_assignment(line) else {
+            continue;
+        };
+        names.push(name.to_string());
+        let value = value.trim_start_matches([' ', '\t']);
+        if let Some(quote) = value.chars().next().filter(|c| matches!(c, '"' | '\''))
+            && closing_quote(&value[1..], quote).is_none()
+        {
+            open_quote = Some(quote);
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Variable names declared in an env file. Values are never kept.
@@ -1343,16 +1516,7 @@ pub fn env_names(path: &Path, warnings: &mut Vec<String>) -> Vec<String> {
             "env-file-truncated: {display}: exceeds {MAX_ENV_BYTES} bytes"
         ));
     }
-    let text = pyfmt::decode_ignore(&raw[..raw.len().min(MAX_ENV_BYTES)]);
-    let mut names: Vec<String> = splitlines(&text)
-        .into_iter()
-        .take(MAX_ENV_LINES)
-        .filter_map(env_name)
-        .map(str::to_string)
-        .collect();
-    names.sort();
-    names.dedup();
-    names
+    env_names_in(&pyfmt::decode_ignore(&raw[..raw.len().min(MAX_ENV_BYTES)]))
 }
 
 /// Find env-like files and record metadata without outputting values.
@@ -1527,11 +1691,15 @@ mod tests {
     }
 
     #[test]
-    fn systemctl_parsers_skip_markers_and_keep_first_position() {
-        let output = "● bad.service loaded failed failed Bad\nshort.service\nx.service a b c\nx.service d e f\n";
+    fn systemctl_parsers_strip_status_markers_and_keep_first_position() {
+        let output = "● bad.service loaded failed failed Bad\nshort.service\nx.service a b c\nx.service d e f\n* gone.service not-found inactive dead gone\n● short.service a b\n";
         assert_eq!(
             parse_systemctl_units(output),
-            vec![("x.service".to_string(), "e".to_string())]
+            vec![
+                ("bad.service".to_string(), "failed".to_string()),
+                ("x.service".to_string(), "e".to_string()),
+                ("gone.service".to_string(), "inactive".to_string()),
+            ]
         );
         assert_eq!(
             parse_systemctl_unit_files("noext enabled\nz.timer static -\n"),
@@ -1635,6 +1803,41 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_unit_directories_mark_the_scan_incomplete() {
+        if running_as_root() {
+            eprintln!("skipped: permission checks do not apply to root");
+            return;
+        }
+        let dir = tmp();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let denied = root.join("denied");
+        let readable = root.join("units");
+        fs::create_dir_all(&denied).unwrap();
+        fs::create_dir_all(&readable).unwrap();
+        write(&denied.join("hidden.service"), b"");
+        write(&readable.join("seen.timer"), b"");
+        chmod(&denied, 0o000);
+        let off = fake(|args| CommandResult::new(0, "", "", &args[0]));
+        let dirs = [
+            spelling(&denied),
+            spelling(&readable),
+            spelling(&root.join("missing")),
+            spelling(&readable.join("seen.timer")),
+        ];
+        let (items, warnings) = collect_systemd(&off, "off", &dirs, true, 1.0);
+        chmod(&denied, 0o755);
+        let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, ["seen.timer"]);
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "inventory-error: {}: Permission denied",
+                denied.display()
+            )]
+        );
+    }
+
+    #[test]
     fn unreadable_directories_are_recorded_not_fatal() {
         if running_as_root() {
             eprintln!("skipped: permission checks do not apply to root");
@@ -1697,6 +1900,30 @@ mod tests {
         let found = find_env_files(&[spelling(&root)], 1, &mut warnings);
 
         assert_eq!(found, vec![internal]);
+    }
+
+    #[test]
+    fn walks_never_enter_symlinked_directories_or_loops() {
+        let parent = tmp();
+        let base = fs::canonicalize(parent.path()).unwrap();
+        let outside = base.join("outside");
+        fs::create_dir_all(outside.join("repo/.git")).unwrap();
+        write(&outside.join(".env"), b"OUTSIDE=1\n");
+        let root = base.join("root");
+        fs::create_dir_all(root.join("real/.git")).unwrap();
+        write(&root.join("real/.env"), b"INSIDE=1\n");
+        symlink(&outside, root.join("linked")).unwrap();
+        symlink(&root, root.join("loop")).unwrap();
+        symlink("self", root.join("self")).unwrap();
+        symlink(&outside, root.join("dir.env")).unwrap();
+        symlink(&outside, root.join(".git")).unwrap();
+
+        let mut warnings = Vec::new();
+        let repos = find_git_repositories(&[spelling(&root)], 5, &mut warnings);
+        assert_eq!(repos, vec![root.join("real")]);
+        let envs = find_env_files(&[spelling(&root)], 5, &mut warnings);
+        assert_eq!(envs, vec![root.join("real/.env")]);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     // tests/test_collectors.py::test_env_read_is_bounded_and_disappearance_is_recorded
@@ -1776,18 +2003,48 @@ mod tests {
         let path = dir.path().join(".envrc");
         write(
             &path,
-            b"export A=1\n B = 2\n#C=3\n\xe2\x80\x83D=4\nE\x1f=5\n1F=6\n_G=7\nH=8\r\nI=9\x0bJ=10\n",
+            b"export A=1\n B = 2\n#C=3\n\xe2\x80\x83D=4\nE\x1f=5\n1F=6\n_G=7\nH=8\r\nI=9\x0bJ=10\nexport=11\nexport  K = 12\nexportL=13\n",
         );
         let mut warnings = Vec::new();
         assert_eq!(
             env_names(&path, &mut warnings),
-            ["B", "D", "E", "H", "I", "J", "_G"]
+            [
+                "A", "B", "D", "E", "H", "I", "J", "K", "_G", "export", "exportL"
+            ]
         );
         let many = dir.path().join("many.env");
         let content: String = (0..1100).map(|i| format!("V{i}=1\n")).collect();
         write(&many, content.as_bytes());
         assert_eq!(env_names(&many, &mut warnings).len(), MAX_ENV_LINES);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn multi_line_quoted_values_are_never_read_as_names() {
+        let text = concat!(
+            "KEY=\"-----BEGIN PRIVATE KEY-----\n",
+            "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj==\n",
+            "SECRETPART=abc\n",
+            "-----END PRIVATE KEY-----\"\n",
+            "AFTER=1\n",
+            "ESC=\"a \\\" still open\nINSIDE=x\n\"\n",
+            "SINGLE='one\nIN_SINGLE=y\n'\n",
+            "SAME_LINE=\"closed\" ok\n",
+            "EMPTY=\"\"\n",
+            "LAST=2\n",
+        );
+        assert_eq!(
+            env_names_in(text),
+            [
+                "AFTER",
+                "EMPTY",
+                "ESC",
+                "KEY",
+                "LAST",
+                "SAME_LINE",
+                "SINGLE"
+            ]
+        );
     }
 
     // tests/test_collectors.py::test_collect_wrappers_records_executables
@@ -1826,6 +2083,40 @@ mod tests {
             write(&path, content);
             assert_eq!(read_shebang(&path), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn shebang_reading_is_bounded_across_blocks() {
+        let dir = tmp();
+        let long_line = format!("#!/bin/{}", "x".repeat(20_000));
+        let mut straddle = vec![b' '; 8191];
+        straddle.extend_from_slice("\u{3000}#!/bin/x\n".as_bytes());
+        let cases: Vec<(&str, Vec<u8>, String)> = vec![
+            (
+                "long",
+                format!("{long_line}\nrest\n").into_bytes(),
+                long_line.clone(),
+            ),
+            (
+                "spaces",
+                [vec![b' '; 9000], b"#!/bin/sh\n".to_vec()].concat(),
+                "#!/bin/sh".into(),
+            ),
+            ("straddle", straddle, "#!/bin/x".into()),
+            ("binary", vec![b'A'; 1 << 20], String::new()),
+            (
+                "huge",
+                [b"#!".to_vec(), vec![b'y'; 100_000]].concat(),
+                format!("#!{}", "y".repeat(MAX_SHEBANG_BYTES as usize - 2)),
+            ),
+        ];
+        for (name, content, expected) in cases {
+            let path = dir.path().join(name);
+            write(&path, &content);
+            assert_eq!(read_shebang(&path), expected, "{name}");
+        }
+        // An endless file without line breaks no longer reads forever.
+        assert_eq!(read_shebang(Path::new("/dev/zero")), "");
     }
 
     // tests/test_collectors.py::test_resolver_ignores_path_spoofing[systemctl|crontab|git]
@@ -1993,11 +2284,11 @@ mod tests {
         fs::create_dir_all(repo.join(".git")).unwrap();
         let git = fake(|args| {
             if args.iter().any(|a| a == "status") {
-                CommandResult::new(0, "", "", &args[0])
+                CommandResult::new(0, "# branch.oid 0abc\n# branch.head main\n", "", &args[0])
             } else if args.iter().any(|a| a == "log") {
                 CommandResult::new(0, "2026-01-01T00:00:00Z\n", "", &args[0])
             } else {
-                CommandResult::new(0, "main\n", "", &args[0])
+                CommandResult::new(0, "unexpected\n", "", &args[0])
             }
         });
 
@@ -2121,6 +2412,33 @@ mod tests {
     }
 
     #[test]
+    fn cron_standard_input_after_percent_is_redacted() {
+        let crontab = concat!(
+            "0 9 * * * mail -s report ops%Dear ops,%password is hunter2%\n",
+            "@daily date +\\%Y-\\%m-\\%d >> /tmp/log\n",
+            "@hourly printf a\\%b%second line\n",
+            "@weekly %all stdin\n",
+        );
+        let exec = fake(move |args| CommandResult::new(0, crontab, "", &args[0]));
+        let (items, warnings) = collect_cron(&exec, 1.0, true);
+        assert!(warnings.is_empty());
+        let previews: Vec<&str> = items
+            .iter()
+            .map(|item| item.metadata.get("command_preview").unwrap())
+            .collect();
+        assert_eq!(
+            previews,
+            [
+                "mail -s report ops%<redacted>",
+                "date +\\%Y-\\%m-\\%d >> /tmp/log",
+                "printf a\\%b%<redacted>",
+                "%<redacted>",
+            ]
+        );
+        assert!(!format!("{items:?}").contains("hunter2"));
+    }
+
+    #[test]
     fn cron_failures_and_missing_crontab() {
         let none = fake(|args| CommandResult::new(1, "", "no crontab for user\n", &args[0]));
         assert_eq!(collect_cron(&none, 1.0, false), (Vec::new(), Vec::new()));
@@ -2221,10 +2539,226 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "r\u{fffd}epo");
         let calls = recorder.0.into_inner().unwrap();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 2);
+        let expected: Vec<OsString> = ["-c", "core.fsmonitor=", "-C"]
+            .map(OsString::from)
+            .into_iter()
+            .chain([repo.clone().into_os_string()])
+            .collect();
         for call in calls {
-            assert_eq!(call[2], repo.clone().into_os_string());
+            assert_eq!(call[1..5], expected[..]);
         }
+    }
+
+    /// Records every `git` call and answers like a repository on `main`
+    /// with one modified file.
+    struct GitRecorder(std::sync::Mutex<Vec<Vec<String>>>);
+
+    impl Exec for GitRecorder {
+        fn resolve(&self, _name: &str) -> Option<String> {
+            Some("/usr/bin/git".into())
+        }
+        fn run(&self, args: &[OsString], _timeout: f64) -> CommandResult {
+            let args = lossy(args);
+            let stdout = match args.iter().map(String::as_str).nth(5) {
+                Some("status") => "# branch.oid 0abc\n# branch.head main\n1 .M N... 1 1 1 a a f\n",
+                Some("rev-parse") => "trunk\n",
+                Some("log") => "2026-01-02T00:00:00+00:00\n",
+                _ => "",
+            };
+            if let Ok(mut calls) = self.0.lock() {
+                calls.push(args);
+            }
+            CommandResult::new(0, stdout, "", "/usr/bin/git")
+        }
+        fn probe(&self, _name: &str, _path: &str, _timeout: f64) -> String {
+            "git version 2".into()
+        }
+    }
+
+    #[test]
+    fn repositories_use_two_git_queries_and_bare_ones_skip_status() {
+        let dir = tmp();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(root.join("work/.git")).unwrap();
+        let bare = root.join("mirror.git");
+        fs::create_dir_all(bare.join("objects")).unwrap();
+        fs::create_dir_all(bare.join("refs")).unwrap();
+        write(&bare.join("HEAD"), b"ref: refs/heads/trunk\n");
+        let recorder = GitRecorder(std::sync::Mutex::new(Vec::new()));
+        let (items, warnings) = collect_repositories(&recorder, &[spelling(&root)], 1, 1.0);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let summary: Vec<(&str, &str, Option<&str>, Option<&str>)> = items
+            .iter()
+            .map(|item| {
+                (
+                    item.name.as_str(),
+                    item.status.as_str(),
+                    item.metadata.get("branch"),
+                    item.metadata.get("dirty_count"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("mirror.git", "bare", Some("trunk"), None),
+                ("work", "dirty", Some("main"), Some("1")),
+            ]
+        );
+        let mut commands: Vec<String> = recorder
+            .0
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .map(|call| {
+                let repo = Path::new(&call[4])
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                format!("{repo}: {}", call[5..].join(" "))
+            })
+            .collect();
+        commands.sort();
+        assert_eq!(
+            commands,
+            [
+                "mirror.git: log -1 --format=%cI",
+                "mirror.git: rev-parse --abbrev-ref HEAD",
+                "work: log -1 --format=%cI",
+                "work: status --porcelain=v2 --branch",
+            ]
+        );
+    }
+
+    #[test]
+    fn porcelain_v2_branch_matches_rev_parse_spelling() {
+        let branch = |text: &str| porcelain_v2_branch(text);
+        assert_eq!(
+            branch("# branch.oid 1a\n# branch.head main\n"),
+            Some("main".into())
+        );
+        assert_eq!(
+            branch("# branch.oid 1a\n# branch.head (detached)\n"),
+            Some("HEAD".into())
+        );
+        assert_eq!(branch("# branch.oid (initial)\n# branch.head main\n"), None);
+        assert_eq!(
+            branch(
+                "# branch.oid 1a\n# branch.head feat/x\n# branch.upstream origin/feat/x\n# branch.ab +1 -0\n"
+            ),
+            Some("feat/x".into())
+        );
+        assert_eq!(branch(""), None);
+    }
+
+    fn real_git() -> Option<String> {
+        resolve_approved_executable("git")
+    }
+
+    fn git_in(git: &str, repo: &Path, args: &[&str]) {
+        let status = Command::new(git)
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", repo)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn real_git_branch_and_dirty_count_match_the_reference_queries() {
+        let Some(git) = real_git() else {
+            eprintln!("skipped: git is not installed");
+            return;
+        };
+        let dir = tmp();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let make = |name: &str| {
+            let repo = root.join(name);
+            fs::create_dir(&repo).unwrap();
+            git_in(&git, &repo, &["init", "-q", "-b", "main"]);
+            repo
+        };
+        let unborn = make("unborn");
+        write(&unborn.join("new"), b"x");
+        let clean = make("clean");
+        git_in(
+            &git,
+            &clean,
+            &["commit", "-q", "--allow-empty", "-m", "one"],
+        );
+        let dirty = make("dirty");
+        write(&dirty.join("a"), b"1");
+        write(&dirty.join("b"), b"1");
+        git_in(&git, &dirty, &["add", "a", "b"]);
+        git_in(&git, &dirty, &["commit", "-q", "-m", "one"]);
+        write(&dirty.join("a"), b"2");
+        git_in(&git, &dirty, &["mv", "b", "c"]);
+        write(&dirty.join("untracked"), b"u");
+        let detached = make("detached");
+        git_in(
+            &git,
+            &detached,
+            &["commit", "-q", "--allow-empty", "-m", "one"],
+        );
+        git_in(&git, &detached, &["checkout", "-q", "--detach"]);
+
+        let (items, warnings) = collect_repositories(&System, &[spelling(&root)], 1, 30.0);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let summary: Vec<(&str, &str, Option<&str>, Option<&str>)> = items
+            .iter()
+            .map(|item| {
+                (
+                    item.name.as_str(),
+                    item.status.as_str(),
+                    item.metadata.get("branch"),
+                    item.metadata.get("dirty_count"),
+                )
+            })
+            .collect();
+        // `rev-parse --abbrev-ref HEAD` fails on an unborn branch and
+        // prints `HEAD` when detached; `status --porcelain` printed one line
+        // per change (modified, renamed, untracked).
+        assert_eq!(
+            summary,
+            [
+                ("clean", "clean", Some("main"), Some("0")),
+                ("detached", "clean", Some("HEAD"), Some("0")),
+                ("dirty", "dirty", Some("main"), Some("3")),
+                ("unborn", "dirty", None, Some("1")),
+            ]
+        );
+    }
+
+    #[test]
+    fn scanning_a_repository_never_starts_the_fsmonitor_daemon() {
+        let Some(git) = real_git() else {
+            eprintln!("skipped: git is not installed");
+            return;
+        };
+        let dir = tmp();
+        let repo = fs::canonicalize(dir.path()).unwrap().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git_in(&git, &repo, &["init", "-q", "-b", "main"]);
+        git_in(&git, &repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git_in(&git, &repo, &["config", "core.fsmonitor", "true"]);
+        let (items, warnings) = collect_repositories(&System, &[spelling(&repo)], 0, 30.0);
+        let daemon_state = repo.join(".git/fsmonitor--daemon");
+        let started = daemon_state.exists();
+        if started {
+            // Never leave a daemon behind, even when the assertion fails.
+            git_in(&git, &repo, &["fsmonitor--daemon", "stop"]);
+        }
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(items[0].status, "clean");
+        assert!(!started, "git status started fsmonitor--daemon");
     }
 
     #[test]

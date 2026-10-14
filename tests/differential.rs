@@ -8,6 +8,13 @@
 //! new name's width. Every case must produce identical stdout, stderr, and
 //! exit status, apart from the version string, the `generated_at` timestamp,
 //! and the renamed Markdown report title.
+//!
+//! The fixture leaves out inputs whose output changed on purpose after
+//! 0.3.0; unit tests cover those instead. Since 0.4.1 these are bare
+//! repositories (status `bare` instead of a `git status` warning),
+//! `export NAME=` lines in env files, lines inside multi-line quoted env
+//! values, `systemctl` status markers, cron standard input after `%`, and
+//! line breaks in Markdown cells.
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -94,9 +101,6 @@ fn build_fixture(root: &Path) {
     let work = root.join("work");
     fs::create_dir_all(work.join("wt")).unwrap();
     fs::write(work.join("wt/.git"), "gitdir: /outside/not-read\n").unwrap();
-    fs::create_dir_all(work.join("bare.git/objects")).unwrap();
-    fs::create_dir_all(work.join("bare.git/refs")).unwrap();
-    fs::write(work.join("bare.git/HEAD"), "ref: refs/heads/main\n").unwrap();
     fs::create_dir_all(work.join("ext.git")).unwrap();
     fs::create_dir_all(work.join("linked")).unwrap();
     symlink("../ext.git", work.join("linked/.git")).unwrap();
@@ -111,7 +115,7 @@ fn build_fixture(root: &Path) {
     fs::write(work.join(".env"), "TOKEN=secret\nPUBLIC=1\n").unwrap();
     fs::write(
         work.join(".envrc"),
-        b"export A=1\n B = 2\n#C=3\n\xe2\x80\x83D=4\nE\x1f=5\n1F=6\n_G=7\nH=8\r\nI=9\n",
+        b"exported A=1\n B = 2\n#C=3\n\xe2\x80\x83D=4\nE\x1f=5\n1F=6\n_G=7\nH=8\r\nI=9\n",
     )
     .unwrap();
     fs::write(work.join("app.env"), "X=1\n").unwrap();
@@ -240,7 +244,13 @@ fn rust_matches_python_reference() {
             .args(["-c", PYTHON_ORACLE]);
         let expected = run(&mut python, &root, &root, case);
         let mut rust = Command::new(env!("CARGO_BIN_EXE_oremap"));
-        let actual = run(&mut rust, &root, &root, case);
+        let mut actual = run(&mut rust, &root, &root, case);
+        if case.contains(&"markdown") {
+            // Markdown cells now spell line breaks as `\n` (the multi-line
+            // `git` error in the fixture); 0.3.0 printed them raw. No fixture
+            // value contains a literal backslash before `n` or `r`.
+            actual.0 = actual.0.replace("\\n", "\n").replace("\\r", "\r");
+        }
         if expected != actual {
             mismatches.push(format!(
                 "{case:?}\n--- python\n{expected:?}\n--- rust\n{actual:?}"

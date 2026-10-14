@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.1 - Unreleased
+
+### Fixed
+
+- Failed, activating, and not-found units keep their `active` state. `systemctl list-units` marks them with `●` (`*` in the C locale), and those lines were skipped, so a failed unit showed an empty state and a not-found unit was missing from the report. On the reference host this restores 9 unit states and 11 discovered units.
+- `git status` can no longer start a background process: every `git` call passes `-c core.fsmonitor=`, so a repository with `core.fsmonitor=true` no longer makes the scan launch `git fsmonitor--daemon` and write its state under `.git`.
+- Bare repositories are reported with status `bare` instead of a failed `git status` warning, so a scan that finds one is no longer marked incomplete (exit 1).
+- A unit directory that exists but cannot be listed is recorded as an `inventory-error` warning and marks the report incomplete, as wrapper directories already did. It used to be skipped silently.
+- `--include-env-names` never lists text from inside a multi-line quoted value. A line of a quoted PEM block that looked like `BASE64TEXT=` was listed as a variable name.
+- `export NAME=value` lines (the usual `.envrc` form) count as variables.
+- Cron command previews end at the first unescaped `%`. Cron feeds the rest of the line to the command's standard input, so it is shown as `%<redacted>`.
+- Markdown reports write line breaks inside a cell or warning as `\n` and `\r`. A file name containing a line break split its table row in two.
+- Wrapper `#!` detection reads at most one 8 KiB block from a file that cannot start with `#!`, and at most 64 KiB from one that does. A large executable without line breaks was read whole: 50 MB took 162 ms and 100 MB of memory, now 2.7 ms and 2.8 MB.
+
+### Faster
+
+- One `git status --porcelain=v2 --branch` call reports both the branch and the changes, replacing the separate `git rev-parse` (still used for bare repositories and when `status` fails). A scan of 64 repositories runs 129 processes instead of 193 and finishes in 254 ms instead of 316 ms; a default scan runs 16 instead of 22. Reported branches and change counts are unchanged.
+- Repository discovery checks for `.git`, `HEAD`, and `objects` in the directory listing it already has, and the walker no longer calls `stat` on symlinks or `lstat` on every sub-directory. Discovery over `/usr/share` (about 9,000 directories, 46,000 symlinks) takes 163 ms instead of 328 ms; an env-file walk of about 26,000 directories takes 183 ms instead of 200 ms.
+
+### Added
+
+- `scripts/build-release.sh` builds the release binaries and a reproducible `dist/oremap-<version>-<target>.tar.gz` with a SHA-256 checksum file.
+
 ## 0.4.0 - 2026-10-05
 
 ### Renamed

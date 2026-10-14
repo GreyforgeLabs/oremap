@@ -37,6 +37,12 @@ Or build it in place; the binary is written to `target/release/oremap`:
 cargo build --release --locked
 ```
 
+To build a release archive with a SHA-256 checksum in `dist/`:
+
+```bash
+./scripts/build-release.sh
+```
+
 Version 0.4.0 is a Rust rewrite of the 0.3.x Python tool, and the first
 release under the name `oremap` (0.3.x and earlier were released as
 `service-cartographer`). It keeps the same command line, report formats,
@@ -82,8 +88,9 @@ External inventory commands are selected only from the reviewed absolute-path
 allowlist. Each collected item records the executable path and bounded version
 diagnostic. Subprocesses receive a minimal environment; `systemctl --user`
 also receives the current user bus address and runtime directory so it can
-query the live user manager, and `git` runs with `GIT_OPTIONAL_LOCKS=0` so
-`git status` never rewrites a repository index. A caller-controlled `PATH`
+query the live user manager, and `git` runs with `GIT_OPTIONAL_LOCKS=0` and
+`-c core.fsmonitor=` so `git status` never rewrites a repository index or
+starts a file-system monitor daemon. A caller-controlled `PATH`
 cannot replace `git`, `systemctl`, or `crontab`.
 
 Every JSON report includes `complete`. A failed or partial requested collector
@@ -115,15 +122,15 @@ repositories take precedence over those hints.
 - User or system systemd units through unit files and `systemctl` read-only listing commands.
 - Current user's crontab through `crontab -l`.
 - Executable wrappers from explicit directories, defaulting to `~/bin` and `~/.local/bin` when present.
-- Git repositories under requested roots with branch, dirty count, and last commit timestamp.
+- Git repositories under requested roots with branch, dirty count, and last commit timestamp. Bare repositories are listed with status `bare`.
 - Environment-like files by metadata only. Values are never emitted.
 
 ## Privacy Defaults
 
 - Hostname is redacted unless `--show-hostname` is passed.
 - Home paths are shortened to `~` unless `--absolute-paths` is passed.
-- Cron command previews redact obvious inline secret assignments.
-- Env files report variable counts by default, not values or names.
+- Cron command previews redact obvious inline secret assignments and the standard input that follows an unescaped `%`.
+- Env files report variable counts by default, not values or names. `--include-env-names` adds names only; lines inside multi-line quoted values are never read as names.
 
 ## Exit Codes
 
@@ -145,7 +152,7 @@ repositories take precedence over those hints.
 - [CONTRIBUTING.md](CONTRIBUTING.md) - contribution workflow
 - [CHANGELOG.md](CHANGELOG.md) - version history
 - [docs/usage.md](docs/usage.md) - usage notes
-- [docs/benchmarks.md](docs/benchmarks.md) - Python vs Rust measurements
+- [docs/benchmarks.md](docs/benchmarks.md) - Python vs Rust, and 0.4.0 vs 0.4.1 measurements
 - [SECURITY.md](SECURITY.md) - responsible disclosure
 
 ## License

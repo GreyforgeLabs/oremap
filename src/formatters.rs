@@ -42,8 +42,20 @@ pub fn format_report(report: &InventoryReport, format: Format) -> String {
     }
 }
 
+/// Make a value safe inside one Markdown table cell or list item: pipes
+/// are escaped, and line breaks, which would end the row and start a new
+/// one with the rest of the value, are written as `\n` and `\r`.
 fn escape(value: &str) -> String {
-    value.replace('|', "\\|")
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '|' => out.push_str("\\|"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 pub fn markdown_report(report: &InventoryReport) -> String {
@@ -255,6 +267,28 @@ mod tests {
             assert_eq!(rows[0], CSV_FIELDS.map(String::from).to_vec());
             assert_eq!(rows[1][column], "' \t=CMD()", "{field}");
         }
+    }
+
+    #[test]
+    fn markdown_line_breaks_cannot_add_table_rows() {
+        let mut item =
+            InventoryItem::new("wrapper", "evil\n| `keep_candidate` | `wrapper` | fake |\r");
+        item.path = "a|b".into();
+        let mut report = report_with(item);
+        report.warnings = vec!["first\nsecond".into()];
+        let rendered = markdown_report(&report);
+        let rows: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("| `") || line.starts_with("| review"))
+            .collect();
+        assert_eq!(
+            rows.last().copied(),
+            Some(
+                "| review | wrapper | evil\\n\\| `keep_candidate` \\| `wrapper` \\| fake \\|\\r |  |  | a\\|b |  |"
+            )
+        );
+        assert!(rendered.contains("- first\\nsecond\n"));
+        assert!(!rendered.contains("\r"));
     }
 
     // tests/test_formatters.py::test_json_remains_exact_machine_format

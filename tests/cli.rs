@@ -434,6 +434,89 @@ fn csv_cells_are_spreadsheet_safe_end_to_end() {
     assert!(csv.ends_with("needs owner decision\r\n"));
 }
 
+/// Every env-file value below contains this marker; no report may show it.
+const SECRET: &str = "S3CR3T";
+
+#[test]
+fn env_file_values_never_reach_any_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(root.join("nested")).unwrap();
+    fs::write(
+        root.join(".env"),
+        format!(
+            concat!(
+                "API_TOKEN={s}-plain\n",
+                "QUOTED=\"{s}-quoted with spaces\"\n",
+                "WITH_EQUALS={s}=a=b\n",
+                "PRIVATE_KEY=\"-----BEGIN PRIVATE KEY-----\n",
+                "{s}BASE64LINE0123456789abcdefABCDEF==\n",
+                "{s}NAMELIKE=inside the key\n",
+                "-----END PRIVATE KEY-----\"\n",
+                "export EXPORTED={s}-exported\n",
+                "  SPACED = {s}-spaced\n",
+                "# COMMENTED={s}-comment\n",
+            ),
+            s = SECRET
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join(".envrc"),
+        format!("export DIRENV_VALUE={SECRET}-direnv\n"),
+    )
+    .unwrap();
+    // Past the 64 KiB read limit: only metadata and a truncation warning.
+    let mut big = "PADDING=x\n".repeat(7000);
+    big.push_str(&format!("LATE={SECRET}-late\n"));
+    fs::write(root.join("nested/big.env"), big).unwrap();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    for format in ["json", "markdown", "csv"] {
+        for names in [false, true] {
+            let report_path = out_dir.path().join(format!("report-{format}-{names}"));
+            for to_file in [false, true] {
+                let mut command = bin();
+                command
+                    .args(["scan", "--format", format, "--systemd-scope", "off"])
+                    .args(["--no-cron", "--no-repos", "--no-wrappers"])
+                    .arg("--env-root")
+                    .arg(&root);
+                if names {
+                    command.arg("--include-env-names");
+                }
+                if to_file {
+                    command.arg("--output").arg(&report_path);
+                }
+                let output = command.output().unwrap();
+                // The truncated file makes the report incomplete (exit 1).
+                assert_eq!(output.status.code(), Some(1), "{format} {names}");
+                let mut text = stdout(&output) + &stderr(&output);
+                if to_file {
+                    text.push_str(&fs::read_to_string(&report_path).unwrap());
+                }
+                assert!(!text.contains(SECRET), "{format} names={names}: {text}");
+                // CSV has no warnings section; the exit status carries it.
+                assert_eq!(text.contains("env-file-truncated"), format != "csv");
+                if format == "json" {
+                    let counts = json_strings(&text, "var_count");
+                    assert_eq!(counts, ["6", "1", "1"], "{text}");
+                    let expected: &[&str] = if names {
+                        &[
+                            "API_TOKEN,EXPORTED,PRIVATE_KEY,QUOTED,SPACED,WITH_EQUALS",
+                            "DIRENV_VALUE",
+                            "PADDING",
+                        ]
+                    } else {
+                        &[]
+                    };
+                    assert_eq!(json_strings(&text, "var_names"), expected);
+                }
+            }
+        }
+    }
+}
+
 const ALIAS_NOTE: &str =
     "service-cartographer: renamed to oremap; this alias will be removed in the next release\n";
 
