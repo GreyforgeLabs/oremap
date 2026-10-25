@@ -20,6 +20,7 @@ Report vulnerabilities through GitHub security advisories or by contacting Greyf
 - Inline secret-looking command assignments are redacted in cron previews.
 - External tools run only from reviewed absolute paths with a minimal environment and `/dev/null` as standard input; `git status` runs with optional index locks and the file-system monitor disabled, so scans never rewrite repository state.
 - Filter drivers configured for a scanned repository are switched off for its `git status`, so a crafted `.git/config` cannot make a scan run its `clean` or `process` commands.
+- `git log` runs with `--no-show-signature`, so a repository's `log.showSignature` cannot make a scan run its `gpg.program`, and `git` runs with `GIT_NO_LAZY_FETCH=1`, so a partial clone never fetches missing objects through its configured remote (`core.sshCommand`, a remote helper) or contacts the network. Git releases before 2.44 ignore `GIT_NO_LAZY_FETCH`.
 
 ## Scope Limits
 

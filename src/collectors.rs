@@ -243,6 +243,11 @@ pub fn subprocess_env(
     if name == "git" {
         // Keep `git status` from opportunistically rewriting .git/index.
         environment.push(("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()));
+        // A partial clone fetches missing objects on demand, which runs the
+        // repository's configured transport (`core.sshCommand`, a remote
+        // helper) and contacts the network. Git 2.44 and later honour this;
+        // older versions ignore it.
+        environment.push(("GIT_NO_LAZY_FETCH".to_string(), "1".to_string()));
     }
     environment
 }
@@ -1390,7 +1395,9 @@ fn probe_repository(
     RepoProbe {
         branch,
         status,
-        last_commit: run(&["log", "-1", "--format=%cI"]),
+        // `log.showSignature` in a repository's configuration would make
+        // `git log` run its configured `gpg.program` on a signed commit.
+        last_commit: run(&["log", "-1", "--no-show-signature", "--format=%cI"]),
     }
 }
 
@@ -2473,8 +2480,11 @@ mod tests {
         assert_eq!(env.len(), 3);
         let env = subprocess_env(&["/usr/bin/git".into(), "status".into()], &none);
         assert_eq!(
-            env.last(),
-            Some(&("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()))
+            env[SAFE_SUBPROCESS_ENV.len()..],
+            [
+                ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
+                ("GIT_NO_LAZY_FETCH".to_string(), "1".to_string()),
+            ]
         );
     }
 
@@ -2768,7 +2778,10 @@ mod tests {
         let repo = root.join(OsString::from_vec(b"r\xffepo".to_vec()));
         fs::create_dir_all(repo.join(".git")).unwrap();
         let recorder = Recorder(Mutex::new(Vec::new()));
-        let (items, warnings) = collect_repositories(&recorder, &[spelling(&root)], 1, 1.0);
+        // A host `/etc/gitconfig` that mentions `filter` would add a query.
+        let missing = root.join("no-system-config");
+        let (items, warnings) =
+            collect_repositories_with(&recorder, &[spelling(&root)], 1, 1.0, &missing);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "r\u{fffd}epo");
@@ -2860,9 +2873,9 @@ mod tests {
         assert_eq!(
             commands,
             [
-                "mirror.git: log -1 --format=%cI",
+                "mirror.git: log -1 --no-show-signature --format=%cI",
                 "mirror.git: rev-parse --abbrev-ref HEAD",
-                "work: log -1 --format=%cI",
+                "work: log -1 --no-show-signature --format=%cI",
                 "work: status --porcelain=v2 --branch",
             ]
         );
@@ -3082,6 +3095,114 @@ mod tests {
             assert_eq!(item.status, "clean", "{item:?}");
             assert_eq!(item.metadata.get("dirty_count"), Some("0"));
         }
+    }
+
+    #[test]
+    fn scanning_never_verifies_signatures_or_fetches_missing_objects() {
+        use std::io::Write;
+        let Some(git) = real_git() else {
+            eprintln!("skipped: git is not installed");
+            return;
+        };
+        let dir = tmp();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let git_out = |repo: &Path, args: &[&str], input: &[u8]| -> String {
+            let mut child = Command::new(&git)
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", repo)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("git runs");
+            child.stdin.take().unwrap().write_all(input).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let make = |name: &str| {
+            let repo = root.join(name);
+            fs::create_dir(&repo).unwrap();
+            git_in(&git, &repo, &["init", "-q", "-b", "main"]);
+            write(&repo.join("f"), b"one\n");
+            git_in(&git, &repo, &["add", "f"]);
+            git_in(&git, &repo, &["commit", "-q", "-m", "one"]);
+            repo
+        };
+        let marker_script = |name: &str| {
+            let marker = root.join(format!("{name}-ran"));
+            let script = root.join(format!("{name}.sh"));
+            write(
+                &script,
+                format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()).as_bytes(),
+            );
+            chmod(&script, 0o755);
+            (script, marker)
+        };
+
+        // `log.showSignature` would make `git log` run `gpg.program` on a
+        // signed HEAD commit.
+        let signed = make("signed");
+        let tree = git_out(&signed, &["rev-parse", "HEAD^{tree}"], b"");
+        let commit = format!(
+            "tree {tree}\nauthor t <t@t> 1 +0000\ncommitter t <t@t> 1 +0000\n\
+             gpgsig -----BEGIN PGP SIGNATURE-----\n \n abc\n -----END PGP SIGNATURE-----\n\
+             \nsigned\n"
+        );
+        let oid = git_out(
+            &signed,
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            commit.as_bytes(),
+        );
+        git_in(&git, &signed, &["update-ref", "refs/heads/main", &oid]);
+        let (gpg, gpg_ran) = marker_script("gpg");
+        git_in(&git, &signed, &["config", "log.showSignature", "true"]);
+        git_in(
+            &git,
+            &signed,
+            &["config", "gpg.program", gpg.to_str().unwrap()],
+        );
+
+        // A partial clone missing HEAD's tree would fetch it through the
+        // promisor remote, running the configured `core.sshCommand`.
+        let partial = make("partial");
+        let tree = git_out(&partial, &["rev-parse", "HEAD^{tree}"], b"");
+        fs::remove_file(
+            partial
+                .join(".git/objects")
+                .join(&tree[..2])
+                .join(&tree[2..]),
+        )
+        .unwrap();
+        let (ssh, ssh_ran) = marker_script("ssh");
+        for (key, value) in [
+            ("core.repositoryformatversion", "1"),
+            ("extensions.partialClone", "origin"),
+            ("remote.origin.url", "ssh://example.invalid/repo"),
+            ("remote.origin.promisor", "true"),
+            ("core.sshCommand", ssh.to_str().unwrap()),
+        ] {
+            git_in(&git, &partial, &["config", key, value]);
+        }
+
+        let roots = [spelling(&signed), spelling(&partial)];
+        let (items, warnings) = collect_repositories(&System, &roots, 0, 30.0);
+        assert!(!gpg_ran.exists(), "git log ran gpg.program");
+        assert!(!ssh_ran.exists(), "git fetched a missing object");
+        let signed_item = items.iter().find(|item| item.name == "signed").unwrap();
+        assert_eq!(signed_item.status, "clean", "{signed_item:?}");
+        assert_eq!(signed_item.last_activity, "1970-01-01T00:00:01Z");
+        // The missing tree is reported instead of fetched.
+        let partial_item = items.iter().find(|item| item.name == "partial").unwrap();
+        assert_eq!(partial_item.status, "unknown", "{partial_item:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with(&format!("git status failed for {}", partial.display())),
+            "{warnings:?}"
+        );
     }
 
     #[test]

@@ -92,7 +92,10 @@ query the live user manager, and `git` runs with `GIT_OPTIONAL_LOCKS=0` and
 `-c core.fsmonitor=` so `git status` never rewrites a repository index or
 starts a file-system monitor daemon. Filter drivers configured for a
 scanned repository (for example `git lfs`, or a `clean` command in a crafted
-`.git/config`) are switched off for its `git status`. Git still checks
+`.git/config`) are switched off for its `git status`. `git log` never checks
+commit signatures, so a repository's `log.showSignature` cannot make it run
+`gpg.program`, and `GIT_NO_LAZY_FETCH=1` stops a partial clone from fetching
+missing objects through its configured remote. Git still checks
 submodule work trees with their own configuration, so point `--repo-root` only
 at repositories you trust. External commands read standard input from
 `/dev/null`. A caller-controlled `PATH` cannot replace `git`, `systemctl`, or
