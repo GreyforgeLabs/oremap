@@ -290,7 +290,7 @@ pub fn run_command_with_env(
         .args(&args[1..])
         .env_clear()
         .envs(subprocess_env(args, getenv))
-        .stdin(Stdio::inherit())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = match command.spawn() {
@@ -2258,6 +2258,22 @@ mod tests {
         assert_eq!(
             missing.stderr,
             "[Errno 2] No such file or directory: '/definitely/missing/tool'"
+        );
+    }
+
+    #[test]
+    fn external_commands_read_stdin_from_dev_null() {
+        let result = run_command(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "readlink /proc/self/fd/0".into(),
+            ],
+            5.0,
+        );
+        assert_eq!(
+            (result.status.as_str(), result.stdout.trim()),
+            ("ok", "/dev/null")
         );
     }
 
