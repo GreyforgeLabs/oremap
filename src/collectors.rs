@@ -1177,6 +1177,158 @@ struct RepoProbe {
 /// means "off" in every Git version.
 const GIT_READ_ONLY_CONFIG: [&str; 2] = ["-c", "core.fsmonitor="];
 
+/// Git's system configuration file for the approved `/usr/bin/git` builds.
+const SYSTEM_GIT_CONFIG: &str = "/etc/gitconfig";
+/// A configuration file larger than this is assumed to define a filter.
+const MAX_CONFIG_SCAN_BYTES: usize = 1024 * 1024;
+/// Lists the clean and process filter drivers configured for a repository.
+/// It reads configuration files only and never runs a driver.
+const FILTER_DRIVER_QUERY: [&str; 5] = [
+    "config",
+    "--null",
+    "--name-only",
+    "--get-regexp",
+    r"^filter\..*\.(clean|process)$",
+];
+
+/// Whether a Git configuration file could define a filter driver: it
+/// mentions `filter` (a `[filter "name"]` section, in any letter case) or
+/// `include` (which can read another file). A missing file cannot; a
+/// symlink, or a file that cannot be read in full, is assumed to.
+fn config_may_define_filters(path: &Path) -> bool {
+    let mut file = match open_no_follow(path) {
+        Ok(file) => file,
+        Err(error) => return error.kind() != io::ErrorKind::NotFound,
+    };
+    match read_bounded(&mut file, MAX_CONFIG_SCAN_BYTES + 1) {
+        Ok(content) if content.len() <= MAX_CONFIG_SCAN_BYTES => {
+            let content = content.to_ascii_lowercase();
+            [b"filter".as_slice(), b"include"]
+                .iter()
+                .any(|word| content.windows(word.len()).any(|window| window == *word))
+        }
+        _ => true,
+    }
+}
+
+/// The repository configuration files Git reads for a work tree:
+/// `config` in the common Git directory and `config.worktree` in the
+/// work tree's own one. A `.git` file (a linked worktree or a submodule
+/// checkout) is followed the way Git reads it, `gitdir: <path>` plus an
+/// optional `commondir`. `None` when that cannot be worked out.
+fn repository_config_files(repo: &Path) -> Option<[PathBuf; 2]> {
+    let marker = repo.join(".git");
+    let kind = fs::symlink_metadata(&marker).ok()?.file_type();
+    let git_dir = if kind.is_dir() {
+        marker
+    } else if kind.is_file() {
+        let mut file = open_no_follow(&marker).ok()?;
+        let content = read_bounded(&mut file, MAX_GIT_MARKER_BYTES as usize).ok()?;
+        let target = content.strip_prefix(b"gitdir: ")?;
+        let end = target
+            .iter()
+            .rposition(|b| !matches!(b, b'\n' | b'\r'))
+            .map_or(0, |last| last + 1);
+        repo.join(OsStr::from_bytes(&target[..end]))
+    } else {
+        return None;
+    };
+    let common_dir = match open_no_follow(&git_dir.join("commondir")) {
+        Ok(mut file) => {
+            let content = read_bounded(&mut file, MAX_GIT_MARKER_BYTES as usize).ok()?;
+            let end = content
+                .iter()
+                .rposition(|b| !matches!(b, b'\n' | b'\r'))
+                .map_or(0, |last| last + 1);
+            git_dir.join(OsStr::from_bytes(&content[..end]))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => git_dir.clone(),
+        Err(_) => return None,
+    };
+    Some([common_dir.join("config"), git_dir.join("config.worktree")])
+}
+
+/// Whether the configuration Git reads for a work tree could define a
+/// filter driver.
+fn repository_may_define_filters(repo: &Path, system_config_may: bool) -> bool {
+    system_config_may
+        || repository_config_files(repo)
+            .is_none_or(|files| files.iter().any(|path| config_may_define_filters(path)))
+}
+
+/// Driver names from [`FILTER_DRIVER_QUERY`] output (NUL-terminated keys
+/// such as `filter.lfs.clean`), or the reason one cannot be disabled
+/// with `-c`: a name containing `=` would be split there, and a name that
+/// was not valid UTF-8 cannot be passed back unchanged.
+fn filter_driver_names(output: &str) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = Vec::new();
+    for key in output.split('\0').filter(|key| !key.is_empty()) {
+        let Some(name) = key.strip_prefix("filter.").and_then(|rest| {
+            rest.strip_suffix(".clean")
+                .or(rest.strip_suffix(".process"))
+        }) else {
+            continue;
+        };
+        if name.contains('=') || name.contains('\u{fffd}') {
+            return Err(format!(
+                "filter driver {} cannot be disabled",
+                repr_str(name)
+            ));
+        }
+        if !names.iter().any(|known| known == name) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// `-c` arguments that switch off every filter driver configured for a
+/// work tree, so `git status` never runs a repository-defined command
+/// when it re-reads a file whose cached stat data is stale. `Err` holds a
+/// failed result to report instead of running `git status` at all.
+fn filter_driver_overrides(
+    exec: &dyn Exec,
+    git: &str,
+    repo: &Path,
+    system_config_may: bool,
+    timeout: f64,
+) -> Result<Vec<OsString>, CommandResult> {
+    if !repository_may_define_filters(repo, system_config_may) {
+        return Ok(Vec::new());
+    }
+    let mut args: Vec<OsString> = vec![git.into()];
+    args.extend(GIT_READ_ONLY_CONFIG.iter().map(OsString::from));
+    args.extend(["-C".into(), repo.as_os_str().to_os_string()]);
+    args.extend(FILTER_DRIVER_QUERY.iter().map(OsString::from));
+    let result = exec.run(&args, timeout);
+    // `git config --get-regexp` exits 1 when nothing matches.
+    let names = match result.code {
+        0 => filter_driver_names(&result.stdout),
+        1 if strip(&result.stderr).is_empty() => Ok(Vec::new()),
+        _ => Err(format!(
+            "filter driver check failed: {}",
+            strip(&result.stderr)
+        )),
+    };
+    match names {
+        Ok(names) => Ok(names
+            .iter()
+            .flat_map(|name| {
+                ["clean=", "process=", "required=false"]
+                    .map(|setting| ["-c".into(), format!("filter.{name}.{setting}").into()])
+            })
+            .flatten()
+            .collect()),
+        Err(reason) => Err(CommandResult {
+            code: if result.code == 0 { 1 } else { result.code },
+            stdout: String::new(),
+            stderr: format!("not run: {reason}"),
+            executable: result.executable,
+            status: "nonzero".to_string(),
+        }),
+    }
+}
+
 /// Branch from `git status --porcelain=v2 --branch` headers, spelled the
 /// way `git rev-parse --abbrev-ref HEAD` prints it: `HEAD` when detached,
 /// nothing for an unborn branch.
@@ -1202,26 +1354,32 @@ fn probe_repository(
     git: &str,
     repo: &Path,
     bare: bool,
+    system_config_may: bool,
     timeout: f64,
 ) -> RepoProbe {
-    let run = |extra: &[&str]| {
+    let run_with = |config: &[OsString], extra: &[&str]| {
         let mut args: Vec<OsString> = vec![git.into()];
         args.extend(GIT_READ_ONLY_CONFIG.iter().map(OsString::from));
+        args.extend(config.iter().cloned());
         args.extend(["-C".into(), repo.as_os_str().to_os_string()]);
         args.extend(extra.iter().map(OsString::from));
         exec.run(&args, timeout)
     };
+    let run = |extra: &[&str]| run_with(&[], extra);
     let rev_parse_branch = || {
         let result = run(&["rev-parse", "--abbrev-ref", "HEAD"]);
         (result.code == 0).then(|| strip(&result.stdout).to_string())
     };
     // One `git status` reports both the branch and the changes; the
     // separate `rev-parse` runs only when there is no work tree or the
-    // status query failed.
+    // status query failed. Only `git status` can run filter drivers.
     let (branch, status) = if bare {
         (rev_parse_branch(), None)
     } else {
-        let status = run(&["status", "--porcelain=v2", "--branch"]);
+        let status = match filter_driver_overrides(exec, git, repo, system_config_may, timeout) {
+            Ok(overrides) => run_with(&overrides, &["status", "--porcelain=v2", "--branch"]),
+            Err(failed) => failed,
+        };
         let branch = if status.code == 0 {
             porcelain_v2_branch(&status.stdout)
         } else {
@@ -1243,12 +1401,32 @@ fn worker_count(jobs: usize) -> usize {
 
 /// Find Git repositories under the requested roots and collect lightweight
 /// state with read-only `git status --porcelain=v2 --branch` and
-/// `git log -1` (plus `git rev-parse` for bare repositories).
+/// `git log -1` (plus `git rev-parse` for bare repositories). Filter
+/// drivers configured for a work tree are switched off for its
+/// `git status`, which adds one `git config` query for a repository whose
+/// configuration mentions `filter` or `include`.
 pub fn collect_repositories(
     exec: &dyn Exec,
     repo_roots: &[String],
     max_depth: i64,
     timeout: f64,
+) -> (Vec<InventoryItem>, Vec<String>) {
+    collect_repositories_with(
+        exec,
+        repo_roots,
+        max_depth,
+        timeout,
+        Path::new(SYSTEM_GIT_CONFIG),
+    )
+}
+
+/// [`collect_repositories`] with an injectable system configuration path.
+fn collect_repositories_with(
+    exec: &dyn Exec,
+    repo_roots: &[String],
+    max_depth: i64,
+    timeout: f64,
+    system_config: &Path,
 ) -> (Vec<InventoryItem>, Vec<String>) {
     let mut warnings = Vec::new();
     let Some(git) = exec.resolve("git") else {
@@ -1264,6 +1442,7 @@ pub fn collect_repositories(
         (version.join().unwrap_or_default(), repos)
     });
 
+    let system_config_may = !repos.is_empty() && config_may_define_filters(system_config);
     let next = AtomicUsize::new(0);
     let mut probes: Vec<Option<RepoProbe>> = (0..repos.len()).map(|_| None).collect();
     let results = std::sync::Mutex::new(&mut probes);
@@ -1276,7 +1455,8 @@ pub fn collect_repositories(
                     let Some((repo, bare)) = repos.get(index) else {
                         break;
                     };
-                    let probe = probe_repository(exec, &git, repo, *bare, timeout);
+                    let probe =
+                        probe_repository(exec, &git, repo, *bare, system_config_may, timeout);
                     if let Ok(mut guard) = results.lock() {
                         guard[index] = Some(probe);
                     }
@@ -2640,7 +2820,9 @@ mod tests {
         fs::create_dir_all(bare.join("refs")).unwrap();
         write(&bare.join("HEAD"), b"ref: refs/heads/trunk\n");
         let recorder = GitRecorder(std::sync::Mutex::new(Vec::new()));
-        let (items, warnings) = collect_repositories(&recorder, &[spelling(&root)], 1, 1.0);
+        let missing = root.join("no-system-config");
+        let (items, warnings) =
+            collect_repositories_with(&recorder, &[spelling(&root)], 1, 1.0, &missing);
         assert!(warnings.is_empty(), "{warnings:?}");
         let summary: Vec<(&str, &str, Option<&str>, Option<&str>)> = items
             .iter()
@@ -2813,6 +2995,301 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(items[0].status, "clean");
         assert!(!started, "git status started fsmonitor--daemon");
+    }
+
+    #[test]
+    fn scanning_a_repository_never_runs_its_filter_drivers() {
+        let Some(git) = real_git() else {
+            eprintln!("skipped: git is not installed");
+            return;
+        };
+        let dir = tmp();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let repo = root.join("repo");
+        fs::create_dir(&repo).unwrap();
+        git_in(&git, &repo, &["init", "-q", "-b", "main"]);
+        write(&repo.join("clean-me"), b"one\n");
+        write(&repo.join("process-me"), b"two\n");
+        git_in(&git, &repo, &["add", "clean-me", "process-me"]);
+        git_in(&git, &repo, &["commit", "-q", "-m", "one"]);
+        // A linked worktree reads the same repository configuration.
+        let linked = root.join("linked");
+        git_in(
+            &git,
+            &repo,
+            &["worktree", "add", "-q", linked.to_str().unwrap()],
+        );
+        // One driver comes from an included file, so the cheap check must
+        // fall through to the `git config` query; the other is direct and
+        // required, so a failing driver would also fail `git status`.
+        let ran_clean = root.join("clean-ran");
+        let ran_process = root.join("process-ran");
+        let included = root.join("drivers.cfg");
+        write(
+            &included,
+            format!(
+                "[filter \"Evil.Clean\"]\n\tclean = sh -c 'touch {}; cat'\n",
+                ran_clean.display()
+            )
+            .as_bytes(),
+        );
+        git_in(
+            &git,
+            &repo,
+            &["config", "include.path", included.to_str().unwrap()],
+        );
+        git_in(
+            &git,
+            &repo,
+            &[
+                "config",
+                "filter.evil-process.process",
+                &format!("sh -c 'touch {}; exit 1'", ran_process.display()),
+            ],
+        );
+        git_in(
+            &git,
+            &repo,
+            &["config", "filter.evil-process.required", "true"],
+        );
+        write(
+            &repo.join(".git/info/attributes"),
+            b"clean-me filter=Evil.Clean\nprocess-me filter=evil-process\n",
+        );
+        // Stale stat data makes `git status` re-read both files.
+        let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        for name in ["clean-me", "process-me"] {
+            File::options()
+                .write(true)
+                .open(repo.join(name))
+                .and_then(|file| file.set_modified(old))
+                .unwrap();
+        }
+        for name in ["clean-me", "process-me"] {
+            File::options()
+                .write(true)
+                .open(linked.join(name))
+                .and_then(|file| file.set_modified(old))
+                .unwrap();
+        }
+        let roots = [spelling(&repo), spelling(&linked)];
+        let (items, warnings) = collect_repositories(&System, &roots, 0, 30.0);
+        assert!(!ran_clean.exists(), "git status ran the clean filter");
+        assert!(!ran_process.exists(), "git status ran the process filter");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(item.status, "clean", "{item:?}");
+            assert_eq!(item.metadata.get("dirty_count"), Some("0"));
+        }
+    }
+
+    #[test]
+    fn filter_drivers_are_disabled_only_when_configuration_could_define_them() {
+        let dir = tmp();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        for name in ["plain", "lfs", "worktree"] {
+            fs::create_dir_all(root.join(name).join(".git")).unwrap();
+        }
+        write(&root.join("plain/.git/config"), b"[core]\n\tbare = false\n");
+        write(
+            &root.join("lfs/.git/config"),
+            b"[Filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n",
+        );
+        write(&root.join("worktree/.git/config"), b"[core]\n");
+        write(
+            &root.join("worktree/.git/config.worktree"),
+            b"[includeIf \"gitdir:/x/\"]\n\tpath = more\n",
+        );
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let seen = std::sync::Arc::clone(&log);
+        let exec = fake(move |args| {
+            seen.lock().unwrap().push(args.to_vec());
+            let repo = args
+                .iter()
+                .position(|a| a == "-C")
+                .map(|i| args[i + 1].clone());
+            let stdout = if args.iter().any(|a| a == "config") {
+                if repo.as_deref().is_some_and(|r| r.ends_with("/lfs")) {
+                    "filter.lfs.clean\0filter.lfs.process\0"
+                } else {
+                    return CommandResult::new(1, "", "", &args[0]);
+                }
+            } else if args.iter().any(|a| a == "status") {
+                "# branch.oid 0abc\n# branch.head main\n"
+            } else {
+                ""
+            };
+            CommandResult::new(0, stdout, "", &args[0])
+        });
+        let missing = root.join("no-system-config");
+        let (items, warnings) =
+            collect_repositories_with(&exec, &[spelling(&root)], 1, 1.0, &missing);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(items.iter().all(|item| item.status == "clean"), "{items:?}");
+        let of = |repo: &str, sub: &str| -> Vec<Vec<String>> {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.iter().any(|a| a.ends_with(&format!("/{repo}"))))
+                .filter(|call| call.iter().any(|a| a == sub))
+                .cloned()
+                .collect()
+        };
+        // A configuration that cannot define a driver costs no query.
+        assert!(of("plain", "config").is_empty());
+        assert_eq!(of("worktree", "config").len(), 1);
+        assert_eq!(of("lfs", "config").len(), 1);
+        let status = |repo: &str| of(repo, "status").remove(0);
+        assert_eq!(
+            status("lfs")[..10],
+            [
+                "/usr/bin/tool",
+                "-c",
+                "core.fsmonitor=",
+                "-c",
+                "filter.lfs.clean=",
+                "-c",
+                "filter.lfs.process=",
+                "-c",
+                "filter.lfs.required=false",
+                "-C",
+            ]
+        );
+        assert_eq!(status("plain")[3], "-C");
+        assert_eq!(status("worktree")[3], "-C");
+
+        // A system configuration that could define drivers sends every
+        // work tree through the query.
+        write(&missing, b"[filter \"lfs\"]\n");
+        log.lock().unwrap().clear();
+        collect_repositories_with(&exec, &[spelling(&root)], 1, 1.0, &missing);
+        for repo in ["plain", "lfs", "worktree"] {
+            assert_eq!(of(repo, "config").len(), 1, "{repo}");
+        }
+    }
+
+    #[test]
+    fn filter_driver_names_refuse_names_that_cannot_be_disabled() {
+        assert_eq!(
+            filter_driver_names("filter.lfs.clean\0filter.lfs.process\0filter.a.b.clean\0"),
+            Ok(vec!["lfs".to_string(), "a.b".to_string()])
+        );
+        assert_eq!(filter_driver_names(""), Ok(Vec::new()));
+        assert_eq!(
+            filter_driver_names("filter.x=y.clean\0"),
+            Err("filter driver 'x=y' cannot be disabled".to_string())
+        );
+        assert!(filter_driver_names("filter.\u{fffd}.process\0").is_err());
+
+        // A name that cannot be disabled, or a failed query, means
+        // `git status` is not run and the repository is reported.
+        let dir = tmp();
+        let repo = fs::canonicalize(dir.path()).unwrap().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        write(&repo.join(".git/config"), b"[include]\n\tpath = x\n");
+        for (code, stdout, stderr, reason) in [
+            (
+                0,
+                "filter.x=y.clean\0",
+                "",
+                "not run: filter driver 'x=y' cannot be disabled",
+            ),
+            (
+                3,
+                "",
+                "fatal: bad config line 1\n",
+                "not run: filter driver check failed: fatal: bad config line 1",
+            ),
+        ] {
+            let exec = fake(move |args| {
+                assert!(!args.iter().any(|a| a == "status"), "status ran: {args:?}");
+                if args.iter().any(|a| a == "config") {
+                    CommandResult::new(code, stdout, stderr, &args[0])
+                } else {
+                    CommandResult::new(0, "main\n", "", &args[0])
+                }
+            });
+            let missing = repo.join("no-system-config");
+            let (items, warnings) =
+                collect_repositories_with(&exec, &[spelling(&repo)], 0, 1.0, &missing);
+            assert_eq!(items[0].status, "unknown");
+            assert_eq!(
+                warnings,
+                vec![format!(
+                    "git status failed for {}: {reason}",
+                    repo.display()
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_files_that_could_define_filter_drivers() {
+        let dir = tmp();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let file = |name: &str, content: &[u8]| {
+            let path = root.join(name);
+            write(&path, content);
+            path
+        };
+        assert!(!config_may_define_filters(&root.join("missing")));
+        assert!(!config_may_define_filters(&file(
+            "plain",
+            b"[core]\n\trepositoryformatversion = 0\n"
+        )));
+        assert!(config_may_define_filters(&file(
+            "upper",
+            b"[FILTER \"x\"]\n"
+        )));
+        assert!(config_may_define_filters(&file("old", b"[filter.x]\n")));
+        assert!(config_may_define_filters(&file(
+            "include",
+            b"[IncludeIf \"onbranch:main\"]\n"
+        )));
+        let large = vec![b'#'; MAX_CONFIG_SCAN_BYTES + 1];
+        assert!(config_may_define_filters(&file("large", &large)));
+        let link = root.join("link");
+        symlink(root.join("plain"), &link).unwrap();
+        assert!(config_may_define_filters(&link));
+
+        let plain = root.join("plain-repo");
+        fs::create_dir_all(plain.join(".git")).unwrap();
+        assert!(!repository_may_define_filters(&plain, false));
+        assert!(repository_may_define_filters(&plain, true));
+
+        // A linked worktree's `.git` file is followed to the common
+        // `config` and its own `config.worktree`, as Git reads them.
+        let main = root.join("main");
+        let admin = main.join(".git/worktrees/linked");
+        fs::create_dir_all(&admin).unwrap();
+        write(&admin.join("commondir"), b"../..\n");
+        let linked = root.join("linked");
+        fs::create_dir(&linked).unwrap();
+        write(
+            &linked.join(".git"),
+            b"gitdir: ../main/.git/worktrees/linked\n",
+        );
+        assert_eq!(
+            repository_config_files(&linked),
+            Some([
+                linked.join("../main/.git/worktrees/linked/../../config"),
+                linked.join("../main/.git/worktrees/linked/config.worktree"),
+            ])
+        );
+        assert!(!repository_may_define_filters(&linked, false));
+        write(&main.join(".git/config"), b"[filter \"lfs\"]\n");
+        assert!(repository_may_define_filters(&linked, false));
+        fs::remove_file(main.join(".git/config")).unwrap();
+        write(&admin.join("config.worktree"), b"[include]\n");
+        assert!(repository_may_define_filters(&linked, false));
+        // A `.git` file Git itself would reject gets the full query.
+        write(
+            &linked.join(".git"),
+            b"gitdir:../main/.git/worktrees/linked\n",
+        );
+        assert_eq!(repository_config_files(&linked), None);
+        assert!(repository_may_define_filters(&linked, false));
     }
 
     #[test]

@@ -90,8 +90,13 @@ diagnostic. Subprocesses receive a minimal environment; `systemctl --user`
 also receives the current user bus address and runtime directory so it can
 query the live user manager, and `git` runs with `GIT_OPTIONAL_LOCKS=0` and
 `-c core.fsmonitor=` so `git status` never rewrites a repository index or
-starts a file-system monitor daemon. A caller-controlled `PATH`
-cannot replace `git`, `systemctl`, or `crontab`.
+starts a file-system monitor daemon. Filter drivers configured for a
+scanned repository (for example `git lfs`, or a `clean` command in a crafted
+`.git/config`) are switched off for its `git status`. Git still checks
+submodule work trees with their own configuration, so point `--repo-root` only
+at repositories you trust. External commands read standard input from
+`/dev/null`. A caller-controlled `PATH` cannot replace `git`, `systemctl`, or
+`crontab`.
 
 Every JSON report includes `complete`. A failed or partial requested collector
 sets it to `false`, records a warning, and makes the command exit 1. Check both

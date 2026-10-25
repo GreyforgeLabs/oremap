@@ -18,5 +18,10 @@ Report vulnerabilities through GitHub security advisories or by contacting Greyf
 - Hostname is hidden by default.
 - Home paths are shortened by default.
 - Inline secret-looking command assignments are redacted in cron previews.
-- External tools run only from reviewed absolute paths with a minimal environment; `git status` runs with optional index locks disabled so scans never rewrite repository state.
+- External tools run only from reviewed absolute paths with a minimal environment and `/dev/null` as standard input; `git status` runs with optional index locks and the file-system monitor disabled, so scans never rewrite repository state.
+- Filter drivers configured for a scanned repository are switched off for its `git status`, so a crafted `.git/config` cannot make a scan run its `clean` or `process` commands.
+
+## Scope Limits
+
+- Git checks submodule work trees with each submodule's own configuration, which oremap does not inspect. Scan only repositories you trust, as you would before running `git status` in them yourself.
 

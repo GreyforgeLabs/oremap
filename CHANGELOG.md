@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.4.1 - Unreleased
+## Unreleased
+
+### Fixed
+
+- `git status` no longer runs filter drivers defined in a scanned repository's configuration. A `clean` or `process` filter assigned through `.gitattributes` or `.git/info/attributes` used to run whenever a file's cached stat data was stale, so scanning a repository with a crafted `.git/config` executed its commands, and a configured `git lfs` filter ran and could write under `.git/lfs`. Each configured driver is now switched off with `-c filter.<name>.clean=`, `-c filter.<name>.process=`, and `-c filter.<name>.required=false`. The drivers are listed with `git config --get-regexp`, which runs only when the repository's configuration (including a linked worktree's common configuration) or `/etc/gitconfig` mentions `filter` or `include`; on the 62 repositories of the reference workspace that is none, so reports and process counts are unchanged there. A driver name that cannot be passed back with `-c` (it contains `=`), or a failed driver query, skips `git status` and records a warning. A file whose stat data is stale and whose content differs from the index only by what a disabled filter would have changed is now counted as dirty. Git still checks submodule work trees with their own configuration.
+- External commands read standard input from `/dev/null` instead of sharing oremap's.
+
+## 0.4.1 - 2026-10-14
 
 ### Fixed
 
