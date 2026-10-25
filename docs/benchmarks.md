@@ -37,9 +37,9 @@ done | sort -n   # median taken from the sorted list
 | Filesystem-only scan (1) | 21 | 64.48 ms | 3.68 ms | 18x |
 | Default scan (2) | 21 | 265.75 ms | 137.12 ms | 1.9x |
 
-1. `scan --format json --systemd-scope off --no-cron --no-repos --env-root ~/Work/workspaces/openforge-native --wrapper-dir ~/.local/bin`
+1. `scan --format json --systemd-scope off --no-cron --no-repos --env-root ~/src/project --wrapper-dir ~/.local/bin`
    gives 60 wrapper items and walks the env-file tree with no subprocesses.
-2. `scan --format json` run from `~/Work/workspaces/openforge-native`
+2. `scan --format json` run from `~/src/project`
    (user systemd, crontab probe, `~/bin` and `~/.local/bin` wrappers,
    repositories to depth 2, env files) gives 508 items: 421 units, 78
    wrappers and 9 repositories. Most of the time goes to the `systemctl` and
@@ -117,7 +117,7 @@ is 851,240 bytes (852,144 for 0.4.0).
 2. As above. This host has 437 units, 93 wrappers and 6 repositories.
 3. `systemctl --user list-unit-files` alone takes about 190 ms here; the
    scan waits for it, so the default scan cannot finish sooner.
-4. `scan --format json --systemd-scope off --no-cron --no-env --no-wrappers --repo-root ~/Work/workspaces --repo-depth 2`.
-5. `scan --format json --systemd-scope off --no-cron --no-repos --no-wrappers --env-root ~/Work --env-depth 4`.
+4. `scan --format json --systemd-scope off --no-cron --no-env --no-wrappers --repo-root ~/src --repo-depth 2`.
+5. `scan --format json --systemd-scope off --no-cron --no-repos --no-wrappers --env-root ~/src --env-depth 4`.
 6. `scan --format json --systemd-scope off --no-cron --no-env --no-wrappers --repo-root /usr/share --repo-depth 6`
    walks about 9,000 directories that hold 46,000 symlinks and no repositories.
