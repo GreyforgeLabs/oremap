@@ -1,6 +1,6 @@
 # Benchmarks: Python 0.3.0 vs Rust 0.4.0 (oremap)
 
-Measured on 2026-10-05 on `greyarch` (Linux 7.2.5 x86_64, AMD Ryzen 5 3600,
+Measured on 2026-10-05 on a desktop workstation (Linux 7.2.5 x86_64, AMD Ryzen 5 3600,
 12 threads, 16 GB RAM) while other jobs were running (1-minute load average
 about 5 to 8). Treat the numbers as indicative, not as lab-grade
 measurements.
