@@ -4214,6 +4214,112 @@ mod tests {
         out
     }
 
+    /// A truncated, flipped, or random index never panics or hangs the
+    /// reader, and a well-formed index that holds a gitlink is never read
+    /// as holding none.
+    #[test]
+    fn index_reader_survives_malformed_input_and_never_hides_a_gitlink() {
+        // A deterministic SplitMix64, so a failure reproduces.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+
+        // Real index layouts, gitlink and plain, across versions and hash
+        // lengths, with varied names (including a long one).
+        let long = "d/".repeat(600) + "f";
+        let mut bases: Vec<Vec<u8>> = Vec::new();
+        for (version, hash_len) in [(2, 20), (2, 32), (3, 20), (3, 32), (4, 20), (4, 32)] {
+            for entries in [
+                vec![(0o100644u32, "f"), (0o160000, "sub")],
+                vec![(0o100644, "a"), (0o040000, "d"), (0o160755, long.as_str())],
+                vec![(0o100644, "only")],
+            ] {
+                bases.push(index_bytes(version, hash_len, &entries, &[b"TREE"]));
+            }
+        }
+
+        // No mutation makes the reader panic, over-read, or hang. A result
+        // of `None` means "assume gitlinks", which is always safe.
+        for _ in 0..6000 {
+            let mut bytes = bases[(next() as usize) % bases.len()].clone();
+            match next() % 4 {
+                // Truncate anywhere, including to nothing.
+                0 => bytes.truncate((next() as usize) % (bytes.len() + 1)),
+                // Flip one bit.
+                1 if !bytes.is_empty() => {
+                    let at = (next() as usize) % bytes.len();
+                    bytes[at] ^= 1 << (next() % 8);
+                }
+                // Overwrite a short run with random bytes.
+                2 if !bytes.is_empty() => {
+                    let at = (next() as usize) % bytes.len();
+                    for byte in bytes[at..].iter_mut().take(1 + (next() as usize) % 16) {
+                        *byte = next() as u8;
+                    }
+                }
+                // A buffer of random length and random bytes.
+                _ => {
+                    bytes = (0..(next() as usize) % 256).map(|_| next() as u8).collect();
+                }
+            }
+            // Must simply return for either hash length.
+            let _ = walk_index(&bytes, 20);
+            let _ = walk_index(&bytes, 32);
+        }
+
+        // The fast path never clears a well-formed index that lists a
+        // gitlink, whatever else it holds and however many entries precede
+        // it, across versions, hash lengths, and extensions.
+        let names = ["a", "b", "zz", long.as_str(), "x/y", "a-really/long/one"];
+        let extensions: [&[u8; 4]; 4] = [b"TREE", b"REUC", b"UNTR", b"sdir"];
+        let dir = tmp();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        for case in 0..2000u64 {
+            let (version, hash_len) =
+                [(2, 20), (2, 32), (3, 20), (3, 32), (4, 20), (4, 32)][(next() as usize) % 6];
+            let count = (next() as usize) % 6;
+            let mut entries: Vec<(u32, &str)> = (0..count)
+                .map(|_| {
+                    let mode = [0o100644u32, 0o100755, 0o120000, 0o040000][(next() as usize) % 4];
+                    (mode, names[(next() as usize) % names.len()])
+                })
+                .collect();
+            // Insert at least one gitlink at a random position; any mode
+            // whose type bits are a gitlink, as Git tests it.
+            let gitlink_mode = 0o160000u32 | (next() as u32 & 0o777);
+            let at = (next() as usize) % (entries.len() + 1);
+            entries.insert(at, (gitlink_mode, names[(next() as usize) % names.len()]));
+            // A sparse index needs no tree entries; keep names unique enough
+            // that Git's own writer would accept the order is not required
+            // here, since only the fast path reads these bytes.
+            let exts: Vec<&[u8; 4]> = if next() % 2 == 0 {
+                vec![extensions[(next() as usize) % extensions.len()]]
+            } else {
+                Vec::new()
+            };
+            let bytes = index_bytes(version, hash_len, &entries, &exts);
+            // The reader for the matching hash length must see the gitlink.
+            let seen = walk_index(&bytes, hash_len);
+            assert!(
+                matches!(seen, Some((true, _)) | None),
+                "case {case}: v{version} {hash_len}B {entries:?} read as {seen:?}"
+            );
+            // And the on-disk path (OR over both hash lengths) must too.
+            let git_dir = root.join(format!("case-{case}"));
+            fs::create_dir(&git_dir).unwrap();
+            write(&git_dir.join("index"), &bytes);
+            assert!(
+                index_may_list_gitlinks(&git_dir),
+                "case {case}: v{version} {hash_len}B {entries:?} cleared on disk"
+            );
+        }
+    }
+
     #[test]
     fn indexes_that_could_list_gitlinks() {
         let plain = index_bytes(2, 20, &[(0o100644, "f"), (0o120000, "link")], &[b"TREE"]);
