@@ -125,7 +125,7 @@ Releases up to 0.3.x shipped as the Python tool `service-cartographer`. 0.4.0 is
 
 The rewrite starts in about 2 ms instead of about 57 ms, and a full default scan takes 137 ms instead of 266 ms. When no external tools run, the scanner's own peak memory drops from about 18 MB to about 3 MB. [docs/benchmarks.md](docs/benchmarks.md) has the commands and numbers.
 
-The old command still works. The release tarball and `cargo install` both include a `service-cartographer` alias that prints a one-line notice to stderr and then behaves exactly like `oremap`. Point scripts and cron entries at `oremap` when convenient.
+The old command still works. The release tarball and `cargo install` both include a `service-cartographer` alias that prints a one-line notice to stderr and then behaves exactly like `oremap`. With the prebuilt tarball, install it next to `oremap` with `install -Dm755 $PKG/service-cartographer ~/.local/bin/service-cartographer`. Point scripts and cron entries at `oremap` when convenient.
 
 ## Requirements
 
