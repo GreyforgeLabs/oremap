@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `scripts/build-release.sh` names the archive `oremap-v<version>-<target>.tar.gz`, matching the tag and the other OpenForge tools. Assets of 0.4.3 and earlier keep their published names.
+
 ## 0.4.3 - 2026-10-26
 
 ### Fixed

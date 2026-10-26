@@ -2,8 +2,11 @@
 # Build the release binaries and a versioned, checksummed archive for the
 # host target:
 #
-#   dist/oremap-<version>-<target>.tar.gz
-#   dist/oremap-<version>-<target>.tar.gz.sha256
+#   dist/oremap-v<version>-<target>.tar.gz
+#   dist/oremap-v<version>-<target>.tar.gz.sha256
+#
+# The "v" matches the tag and the other OpenForge release assets
+# (releases up to 0.4.3 were named oremap-<version>-<target>).
 #
 # The archive is reproducible for a given commit and toolchain: entries are
 # sorted, owned by 0:0, and stamped with SOURCE_DATE_EPOCH (default: the
@@ -47,7 +50,7 @@ if [ "$reported" != "oremap $VERSION" ]; then
     exit 1
 fi
 
-NAME="oremap-$VERSION-$TARGET"
+NAME="oremap-v$VERSION-$TARGET"
 STAGE="dist/$NAME"
 rm -rf "$STAGE" "dist/$NAME.tar.gz" "dist/$NAME.tar.gz.sha256"
 mkdir -p "$STAGE"

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1306" height="577" viewBox="0 0 1306 577" role="img" aria-label="oremap scan">
+<title>oremap scan</title>
+<rect width="1306" height="577" rx="10" fill="#0a0d11"/>
+<path d="M0 10a10 10 0 0 1 10-10h1286a10 10 0 0 1 10 10v18H0z" fill="#151a21"/>
+<circle cx="18" cy="14" r="5.5" fill="#ff5f57"/>
+<circle cx="36" cy="14" r="5.5" fill="#febc2e"/>
+<circle cx="54" cy="14" r="5.5" fill="#28c840"/>
+<text x="653.0" y="18.5" text-anchor="middle" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="#7d8794">oremap scan</text>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono','DejaVu Sans Mono',monospace" font-size="13" fill="#e9edf1" xml:space="preserve">
+<text x="18" y="44" textLength="1266.8" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">$ </tspan><tspan fill="#ffffff">oremap scan --repo-root ~/src --wrapper-dir ~/bin --keep-keyword invoice --retire-keyword legacy --retire-keyword scraper --no-cron --no-env --systemd-scope off</tspan></text>
+<text x="18" y="63" textLength="117.3" lengthAdjust="spacingAndGlyphs"><tspan fill="#be96ff"># oremap Report</tspan></text>
+<text x="18" y="101" textLength="367.5" lengthAdjust="spacingAndGlyphs">- Generated: <tspan fill="#38c8e8">`2026-10-26T21:55:44.983345+00:00`</tspan></text>
+<text x="18" y="120" textLength="140.8" lengthAdjust="spacingAndGlyphs">- Host: <tspan fill="#38c8e8">`redacted`</tspan></text>
+<text x="18" y="139" textLength="93.8" lengthAdjust="spacingAndGlyphs">- Items: <tspan fill="#38c8e8">`5`</tspan></text>
+<text x="18" y="158" textLength="132.9" lengthAdjust="spacingAndGlyphs">- Complete: <tspan fill="#38c8e8">`yes`</tspan></text>
+<text x="18" y="196" textLength="78.2" lengthAdjust="spacingAndGlyphs"><tspan fill="#be96ff">## Summary</tspan></text>
+<text x="18" y="234" textLength="140.8" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> Metric <tspan fill="#7d8794">|</tspan> Count <tspan fill="#7d8794">|</tspan></text>
+<text x="18" y="253" textLength="78.2" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|---|---:|</tspan></text>
+<text x="18" y="272" textLength="242.4" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> <tspan fill="#38c8e8">`action:</tspan><tspan fill="#7ed38c">keep_candidate</tspan><tspan fill="#38c8e8">`</tspan> <tspan fill="#7d8794">|</tspan> 1 <tspan fill="#7d8794">|</tspan></text>
+<text x="18" y="291" textLength="258.1" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> <tspan fill="#38c8e8">`action:</tspan><tspan fill="#fda52b">retire_candidate</tspan><tspan fill="#38c8e8">`</tspan> <tspan fill="#7d8794">|</tspan> 2 <tspan fill="#7d8794">|</tspan></text>
+<text x="18" y="310" textLength="179.9" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> <tspan fill="#38c8e8">`action:review`</tspan> <tspan fill="#7d8794">|</tspan> 2 <tspan fill="#7d8794">|</tspan></text>
+<text x="18" y="329" textLength="156.4" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> <tspan fill="#38c8e8">`repository`</tspan> <tspan fill="#7d8794">|</tspan> 3 <tspan fill="#7d8794">|</tspan></text>
+<text x="18" y="348" textLength="117.3" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> <tspan fill="#38c8e8">`total`</tspan> <tspan fill="#7d8794">|</tspan> 5 <tspan fill="#7d8794">|</tspan></text>
+<text x="18" y="367" textLength="132.9" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> <tspan fill="#38c8e8">`wrapper`</tspan> <tspan fill="#7d8794">|</tspan> 2 <tspan fill="#7d8794">|</tspan></text>
+<text x="18" y="405" textLength="179.9" lengthAdjust="spacingAndGlyphs"><tspan fill="#be96ff">## Keep / Retire Matrix</tspan></text>
+<text x="18" y="443" textLength="508.3" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> Action <tspan fill="#7d8794">|</tspan> Kind <tspan fill="#7d8794">|</tspan> Name <tspan fill="#7d8794">|</tspan> Status <tspan fill="#7d8794">|</tspan> Last activity <tspan fill="#7d8794">|</tspan> Path <tspan fill="#7d8794">|</tspan> Reason <tspan fill="#7d8794">|</tspan></text>
+<text x="18" y="462" textLength="226.8" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|---|---|---|---|---|---|---|</tspan></text>
+<text x="18" y="481" textLength="1001.0" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> <tspan fill="#7ed38c">keep_candidate</tspan> <tspan fill="#7d8794">|</tspan> repository <tspan fill="#7d8794">|</tspan> invoice-sync <tspan fill="#7d8794">|</tspan> status=clean <tspan fill="#7d8794">|</tspan> 2026-10-20T10:00:00Z <tspan fill="#7d8794">|</tspan> <tspan fill="#7d8794">~/src/invoice-sync</tspan> <tspan fill="#7d8794">|</tspan> matched keep keyword <tspan fill="#7d8794">|</tspan></text>
+<text x="18" y="500" textLength="1157.4" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> <tspan fill="#fda52b">retire_candidate</tspan> <tspan fill="#7d8794">|</tspan> repository <tspan fill="#7d8794">|</tspan> old-scraper <tspan fill="#7d8794">|</tspan> status=clean <tspan fill="#7d8794">|</tspan> 2025-11-02T10:00:00Z <tspan fill="#7d8794">|</tspan> <tspan fill="#7d8794">~/src/old-scraper</tspan> <tspan fill="#7d8794">|</tspan> matched operator-supplied retire keyword <tspan fill="#7d8794">|</tspan></text>
+<text x="18" y="519" textLength="1243.4" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> <tspan fill="#fda52b">retire_candidate</tspan> <tspan fill="#7d8794">|</tspan> wrapper <tspan fill="#7d8794">|</tspan> legacy-report <tspan fill="#7d8794">|</tspan> status=executable <tspan fill="#7d8794">|</tspan> 2025-12-14T18:05:00+00:00 <tspan fill="#7d8794">|</tspan> <tspan fill="#7d8794">~/bin/legacy-report</tspan> <tspan fill="#7d8794">|</tspan> matched operator-supplied retire keyword <tspan fill="#7d8794">|</tspan></text>
+<text x="18" y="538" textLength="938.4" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> <tspan fill="#38c8e8">review</tspan> <tspan fill="#7d8794">|</tspan> repository <tspan fill="#7d8794">|</tspan> site-builder <tspan fill="#7d8794">|</tspan> status=clean <tspan fill="#7d8794">|</tspan> 2026-10-24T10:00:00Z <tspan fill="#7d8794">|</tspan> <tspan fill="#7d8794">~/src/site-builder</tspan> <tspan fill="#7d8794">|</tspan> needs owner decision <tspan fill="#7d8794">|</tspan></text>
+<text x="18" y="557" textLength="1024.4" lengthAdjust="spacingAndGlyphs"><tspan fill="#7d8794">|</tspan> <tspan fill="#38c8e8">review</tspan> <tspan fill="#7d8794">|</tspan> wrapper <tspan fill="#7d8794">|</tspan> nightly-backup <tspan fill="#7d8794">|</tspan> status=executable <tspan fill="#7d8794">|</tspan> 2026-10-22T07:30:00+00:00 <tspan fill="#7d8794">|</tspan> <tspan fill="#7d8794">~/bin/nightly-backup</tspan> <tspan fill="#7d8794">|</tspan> needs owner decision <tspan fill="#7d8794">|</tspan></text>
+</g>
+</svg>
