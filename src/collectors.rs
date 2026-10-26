@@ -2,7 +2,7 @@
 //!
 //! Nothing here starts, stops, enables, or edits anything. Filesystem access
 //! is limited to `stat`, directory listing, and bounded no-follow reads of
-//! `.git` marker files and env files. External tools come only from a fixed
+//! `.git` marker files, Git configuration and index files, and env files. External tools come only from a fixed
 //! absolute-path allowlist and run with a minimal environment.
 
 use std::collections::HashSet;
@@ -1196,11 +1196,10 @@ const FILTER_DRIVER_QUERY: [&str; 5] = [
     r"^filter\..*\.(clean|process)$",
 ];
 
-/// Whether a Git configuration file could define a filter driver: it
-/// mentions `filter` (a `[filter "name"]` section, in any letter case) or
-/// `include` (which can read another file). A missing file cannot; a
+/// Whether a Git configuration file mentions one of `words` (ASCII
+/// lower case, matched in any letter case). A missing file does not; a
 /// symlink, or a file that cannot be read in full, is assumed to.
-fn config_may_define_filters(path: &Path) -> bool {
+fn config_mentions(path: &Path, words: &[&[u8]]) -> bool {
     let mut file = match open_no_follow(path) {
         Ok(file) => file,
         Err(error) => return error.kind() != io::ErrorKind::NotFound,
@@ -1208,7 +1207,7 @@ fn config_may_define_filters(path: &Path) -> bool {
     match read_bounded(&mut file, MAX_CONFIG_SCAN_BYTES + 1) {
         Ok(content) if content.len() <= MAX_CONFIG_SCAN_BYTES => {
             let content = content.to_ascii_lowercase();
-            [b"filter".as_slice(), b"include"]
+            words
                 .iter()
                 .any(|word| content.windows(word.len()).any(|window| window == *word))
         }
@@ -1216,13 +1215,58 @@ fn config_may_define_filters(path: &Path) -> bool {
     }
 }
 
-/// The repository configuration files Git reads for a work tree:
-/// `config` in the common Git directory and `config.worktree` in the
-/// work tree's own one. A `.git` file (a linked worktree or a submodule
-/// checkout) is followed the way Git reads it, `gitdir: <path>` plus an
-/// optional `commondir`. `None` when that cannot be worked out.
-fn repository_config_files(repo: &Path) -> Option<[PathBuf; 2]> {
-    let marker = repo.join(".git");
+/// Whether a Git configuration file could define a filter driver: it
+/// mentions `filter` (a `[filter "name"]` section, in any letter case) or
+/// `include` (which can read another file). A missing file cannot; a
+/// symlink, or a file that cannot be read in full, is assumed to.
+fn config_may_define_filters(path: &Path) -> bool {
+    config_mentions(path, &[b"filter", b"include"])
+}
+
+/// Whether a Git configuration file could move its work tree with
+/// `core.worktree`: it mentions `worktree` or `include`.
+fn config_may_move_work_tree(path: &Path) -> bool {
+    config_mentions(path, &[b"worktree", b"include"])
+}
+
+/// The Git directories behind one work tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitDirs {
+    /// The work tree's own directory, with its `index`,
+    /// `config.worktree`, and `modules/`.
+    git_dir: PathBuf,
+    /// The common directory, with the repository `config`.
+    common_dir: PathBuf,
+}
+
+impl GitDirs {
+    /// The repository configuration files Git reads for the work tree:
+    /// `config` in the common directory and `config.worktree` in its own.
+    fn config_files(&self) -> [PathBuf; 2] {
+        [
+            self.common_dir.join("config"),
+            self.git_dir.join("config.worktree"),
+        ]
+    }
+}
+
+/// `bytes` without trailing line breaks, as Git trims `.git` files and
+/// `commondir`.
+fn trim_line_breaks(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|b| !matches!(b, b'\n' | b'\r'))
+        .map_or(0, |last| last + 1);
+    &bytes[..end]
+}
+
+/// The Git directories of the work tree at `work_tree`, found from its
+/// `.git` the way Git reads it: a directory, or a file holding
+/// `gitdir: <path>` (a linked worktree or a submodule checkout, relative
+/// to `work_tree`), plus an optional `commondir`. `None` when that cannot
+/// be worked out.
+fn resolve_git_dirs(work_tree: &Path) -> Option<GitDirs> {
+    let marker = work_tree.join(".git");
     let kind = fs::symlink_metadata(&marker).ok()?.file_type();
     let git_dir = if kind.is_dir() {
         marker
@@ -1230,41 +1274,164 @@ fn repository_config_files(repo: &Path) -> Option<[PathBuf; 2]> {
         let mut file = open_no_follow(&marker).ok()?;
         let content = read_bounded(&mut file, MAX_GIT_MARKER_BYTES as usize).ok()?;
         let target = content.strip_prefix(b"gitdir: ")?;
-        let end = target
-            .iter()
-            .rposition(|b| !matches!(b, b'\n' | b'\r'))
-            .map_or(0, |last| last + 1);
-        repo.join(OsStr::from_bytes(&target[..end]))
+        work_tree.join(OsStr::from_bytes(trim_line_breaks(target)))
     } else {
         return None;
     };
     let common_dir = match open_no_follow(&git_dir.join("commondir")) {
         Ok(mut file) => {
             let content = read_bounded(&mut file, MAX_GIT_MARKER_BYTES as usize).ok()?;
-            let end = content
-                .iter()
-                .rposition(|b| !matches!(b, b'\n' | b'\r'))
-                .map_or(0, |last| last + 1);
-            git_dir.join(OsStr::from_bytes(&content[..end]))
+            git_dir.join(OsStr::from_bytes(trim_line_breaks(&content)))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => git_dir.clone(),
         Err(_) => return None,
     };
-    Some([common_dir.join("config"), git_dir.join("config.worktree")])
+    Some(GitDirs {
+        git_dir,
+        common_dir,
+    })
 }
 
 /// Whether the configuration Git reads for a work tree could define a
-/// filter driver.
-fn repository_may_define_filters(repo: &Path, system_config_may: bool) -> bool {
+/// filter driver. Unknown Git directories (`None`) are assumed to.
+fn repository_may_define_filters(dirs: Option<&GitDirs>, system_config_may: bool) -> bool {
     system_config_may
-        || repository_config_files(repo)
-            .is_none_or(|files| files.iter().any(|path| config_may_define_filters(path)))
+        || dirs.is_none_or(|dirs| {
+            dirs.config_files()
+                .iter()
+                .any(|path| config_may_define_filters(path))
+        })
+}
+
+/// An index file larger than this is assumed to list a gitlink.
+const MAX_INDEX_SCAN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Whether `mode` is a gitlink the way Git tests it (`S_ISGITLINK`): only
+/// the file-type bits count, so `0o160755` is one too.
+fn is_gitlink_mode(mode: u32) -> bool {
+    mode & 0o170000 == 0o160000
+}
+
+/// Walks an index file laid out for object names of `hash_len` bytes, the
+/// way Git reads it: `Some((entries, split))` when the layout fits, where
+/// `entries` says an entry is a gitlink or the index is sparse (an `sdir`
+/// extension folds directories into tree entries), and `split` that it is
+/// a split index (`link` extension).
+fn walk_index(content: &[u8], hash_len: usize) -> Option<(bool, bool)> {
+    let be32 = |at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(
+            content.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    if content.get(..4)? != b"DIRC" {
+        return None;
+    }
+    let version = be32(4)?;
+    if !(2..=4).contains(&version) {
+        return None;
+    }
+    let count = be32(8)?;
+    let end = content.len().checked_sub(hash_len)?;
+    let nul_after = |at: usize| content.get(at..end)?.iter().position(|b| *b == 0);
+    let (mut entries, mut split) = (false, false);
+    let mut at = 12;
+    for _ in 0..count {
+        // ctime, mtime, dev, ino, then the mode; flags follow the name.
+        entries |= is_gitlink_mode(be32(at + 24)?);
+        let flags_at = at + 40 + hash_len;
+        let flags = u16::from_be_bytes(content.get(flags_at..flags_at + 2)?.try_into().ok()?);
+        let mut name_at = flags_at + 2;
+        if flags & 0x4000 != 0 {
+            if version < 3 {
+                return None;
+            }
+            name_at += 2;
+        }
+        at = if version == 4 {
+            // A varint (the prefix length taken from the previous name),
+            // then the rest of the name, NUL-terminated.
+            while content.get(name_at)? & 0x80 != 0 {
+                name_at += 1;
+            }
+            name_at + 1 + nul_after(name_at + 1)? + 1
+        } else {
+            let length = match usize::from(flags & 0x0fff) {
+                0x0fff => nul_after(name_at)?,
+                length => length,
+            };
+            // Padded with 1 to 8 NULs to a multiple of 8 bytes.
+            at + ((name_at - at + length + 8) & !7)
+        };
+        if at > end {
+            return None;
+        }
+    }
+    // Extensions: a 4-byte signature and a 4-byte size, while 8 bytes fit.
+    while end - at >= 8 {
+        match content.get(at..at + 4)? {
+            b"link" => split = true,
+            b"sdir" => entries = true,
+            _ => {}
+        }
+        at = at.checked_add(8 + usize::try_from(be32(at + 4)?).ok()?)?;
+        if at > end {
+            return None;
+        }
+    }
+    Some((entries, split))
+}
+
+/// What one index file shows: `Some((entries, split))` as in
+/// [`walk_index`], for SHA-1 or SHA-256 object names (both, when both
+/// layouts fit); `None` when it cannot be read in full or fits neither
+/// layout. A missing file lists nothing.
+fn index_file_hints(path: &Path) -> Option<(bool, bool)> {
+    let mut file = match open_no_follow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some((false, false)),
+        Err(_) => return None,
+    };
+    let content = read_bounded(&mut file, MAX_INDEX_SCAN_BYTES + 1).ok()?;
+    if content.len() > MAX_INDEX_SCAN_BYTES {
+        return None;
+    }
+    [20, 32]
+        .into_iter()
+        .filter_map(|hash_len| walk_index(&content, hash_len))
+        .reduce(|(entries, split), (more, also)| (entries || more, split || also))
+}
+
+/// Whether the index in `git_dir` could list a gitlink (a submodule
+/// entry); see [`index_file_hints`]. A split index keeps most entries in
+/// a `sharedindex.<hash>` file beside it, which is checked too; Git
+/// cannot read a split index whose shared file is missing. A symlinked,
+/// unreadable, or oversized file is assumed to list one.
+fn index_may_list_gitlinks(git_dir: &Path) -> bool {
+    let Some((entries, split)) = index_file_hints(&git_dir.join("index")) else {
+        return true;
+    };
+    if entries || !split {
+        return entries;
+    }
+    let Ok(listing) = fs::read_dir(git_dir) else {
+        return true;
+    };
+    for entry in listing {
+        let Ok(entry) = entry else { return true };
+        if entry.file_name().as_bytes().starts_with(b"sharedindex.")
+            && index_file_hints(&entry.path()).is_none_or(|(entries, _)| entries)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Driver names from [`FILTER_DRIVER_QUERY`] output (NUL-terminated keys
 /// such as `filter.lfs.clean`), or the reason one cannot be disabled
-/// with `-c`: a name containing `=` would be split there, and a name that
-/// was not valid UTF-8 cannot be passed back unchanged.
+/// with `-c`: a name containing `=` would be split there, a name that
+/// was not valid UTF-8 cannot be passed back unchanged, and a line break
+/// may stand for a carriage return that output decoding replaced.
 fn filter_driver_names(output: &str) -> Result<Vec<String>, String> {
     let mut names: Vec<String> = Vec::new();
     for key in output.split('\0').filter(|key| !key.is_empty()) {
@@ -1274,7 +1441,7 @@ fn filter_driver_names(output: &str) -> Result<Vec<String>, String> {
         }) else {
             continue;
         };
-        if name.contains('=') || name.contains('\u{fffd}') {
+        if name.contains(['=', '\n', '\u{fffd}']) {
             return Err(format!(
                 "filter driver {} cannot be disabled",
                 repr_str(name)
@@ -1287,10 +1454,303 @@ fn filter_driver_names(output: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// Why a repository's `git status` is not run; reported as its failure.
+#[derive(Debug)]
+struct NotRun {
+    code: i32,
+    reason: String,
+}
+
+impl NotRun {
+    fn new(reason: impl Into<String>) -> Self {
+        NotRun {
+            code: 1,
+            reason: reason.into(),
+        }
+    }
+
+    /// A failed query's exit code (never 0) and reason.
+    fn from_result(result: &CommandResult, what: &str) -> Self {
+        NotRun {
+            code: if result.code == 0 { 1 } else { result.code },
+            reason: format!("{what} failed: {}", strip(&result.stderr)),
+        }
+    }
+
+    /// The same failure, attributed to the submodule at `shown`.
+    fn in_submodule(self, shown: &str) -> Self {
+        NotRun {
+            code: self.code,
+            reason: format!("submodule {}: {}", repr_str(shown), self.reason),
+        }
+    }
+}
+
+/// `git` arguments for a query in `dir`. Inside a submodule checkout the
+/// query also passes `--git-dir=.git`, which is how `git status` starts
+/// its own check there (`GIT_DIR=.git`), so configuration, conditional
+/// includes, and `core.worktree` resolve exactly as they do for that
+/// check.
+fn git_query_args(git: &str, dir: &Path, submodule: bool, query: &[&str]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![git.into()];
+    args.extend(GIT_READ_ONLY_CONFIG.iter().map(OsString::from));
+    args.extend(["-C".into(), dir.as_os_str().to_os_string()]);
+    if submodule {
+        args.push("--git-dir=.git".into());
+    }
+    args.extend(query.iter().map(OsString::from));
+    args
+}
+
+/// Add the filter drivers configured for the work tree in `dir` to
+/// `names`. The query reads configuration files only and never runs a
+/// driver.
+fn query_filter_drivers(
+    exec: &dyn Exec,
+    git: &str,
+    dir: &Path,
+    submodule: bool,
+    timeout: f64,
+    names: &mut Vec<String>,
+) -> Result<(), NotRun> {
+    let result = exec.run(
+        &git_query_args(git, dir, submodule, &FILTER_DRIVER_QUERY),
+        timeout,
+    );
+    // `git config --get-regexp` exits 1 when nothing matches.
+    let found = match result.code {
+        0 => filter_driver_names(&result.stdout).map_err(NotRun::new)?,
+        1 if strip(&result.stderr).is_empty() => Vec::new(),
+        _ => return Err(NotRun::from_result(&result, "filter driver check")),
+    };
+    for name in found {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(())
+}
+
+/// Lists every index entry, including those outside the current
+/// directory, with its mode; gitlinks have mode `160000`.
+const GITLINK_QUERY: [&str; 6] = ["ls-files", "--stage", "-z", "--full-name", "--", ":/"];
+
+/// Paths of the gitlinks (submodule entries) in the index of the work
+/// tree in `dir`, relative to its top level, whether or not `.gitmodules`
+/// mentions them: `git status` checks every populated one.
+fn gitlink_paths(
+    exec: &dyn Exec,
+    git: &str,
+    dir: &Path,
+    submodule: bool,
+    timeout: f64,
+) -> Result<Vec<String>, NotRun> {
+    let result = exec.run(
+        &git_query_args(git, dir, submodule, &GITLINK_QUERY),
+        timeout,
+    );
+    if result.code != 0 {
+        return Err(NotRun::from_result(&result, "submodule check"));
+    }
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in result.stdout.split('\0').filter(|entry| !entry.is_empty()) {
+        // `<mode> <object> <stage>\t<path>`
+        let parsed = entry.split_once('\t').and_then(|(info, path)| {
+            let mode = u32::from_str_radix(info.split(' ').next()?, 8).ok()?;
+            Some((mode, path))
+        });
+        let Some((mode, path)) = parsed else {
+            return Err(NotRun::new(
+                "submodule check failed: unexpected git ls-files output",
+            ));
+        };
+        // Unmerged entries list one path up to three times.
+        if is_gitlink_mode(mode) && seen.insert(path) {
+            paths.push(path.to_string());
+        }
+    }
+    Ok(paths)
+}
+
+/// `path` as a relative path inside a work tree, or `None` when it could
+/// not name the directory Git would check: it is absolute, has `.` or
+/// `..` components, or lost bytes in output decoding (not valid UTF-8,
+/// or a carriage return turned into a line break).
+fn gitlink_relative_path(path: &str) -> Option<&Path> {
+    let relative = Path::new(path);
+    let plain = !path.is_empty()
+        && !path.contains(['\n', '\u{fffd}'])
+        && relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+    plain.then_some(relative)
+}
+
+/// The work tree Git uses for `dir`: `dir` itself, unless the
+/// configuration could set `core.worktree`, in which case Git is asked.
+fn effective_work_tree(
+    exec: &dyn Exec,
+    git: &str,
+    dir: &Path,
+    submodule: bool,
+    dirs: &GitDirs,
+    timeout: f64,
+) -> Result<PathBuf, NotRun> {
+    if !dirs
+        .config_files()
+        .iter()
+        .any(|path| config_may_move_work_tree(path))
+    {
+        return Ok(dir.to_path_buf());
+    }
+    let query = ["rev-parse", "--show-toplevel"];
+    let result = exec.run(&git_query_args(git, dir, submodule, &query), timeout);
+    let top = result.stdout.strip_suffix('\n').unwrap_or(&result.stdout);
+    if result.code != 0 {
+        return Err(NotRun::from_result(&result, "work tree check"));
+    }
+    if !top.starts_with('/') || top.contains(['\n', '\u{fffd}']) {
+        return Err(NotRun::new("work tree path cannot be checked"));
+    }
+    Ok(PathBuf::from(top))
+}
+
+/// Deepest submodule nesting that a scan follows.
+const MAX_SUBMODULE_DEPTH: usize = 8;
+/// Most populated submodules, at every depth, that a scan follows for one
+/// repository.
+const MAX_SUBMODULES: usize = 512;
+
+/// `path` resolved, when it lies inside one of `roots` (resolved too).
+fn resolved_inside(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    let resolved = fs::canonicalize(path).ok()?;
+    roots
+        .iter()
+        .any(|root| resolved.starts_with(root))
+        .then_some(resolved)
+}
+
+/// Add the filter drivers configured in every populated submodule that
+/// `git status` in `repo` would check, at every depth, to `names`.
+///
+/// `git status` checks a populated submodule by starting `git status`
+/// inside it, which reads the submodule's own configuration and checks
+/// its own submodules in turn. Those processes inherit the `-c`
+/// overrides, so disabling every driver found here keeps them from
+/// running any. Gitlinks come from the index, not `.gitmodules`. Each
+/// submodule's `.git` must resolve, without a symlink, to a Git directory
+/// inside the scanned repository's work tree or Git directories, and the
+/// walk stops at [`MAX_SUBMODULE_DEPTH`] and [`MAX_SUBMODULES`]; anything
+/// else is refused, so `git status` is not run.
+fn submodule_filter_drivers(
+    exec: &dyn Exec,
+    git: &str,
+    repo: &Path,
+    dirs: &GitDirs,
+    system_config_may: bool,
+    timeout: f64,
+    names: &mut Vec<String>,
+) -> Result<(), NotRun> {
+    // Where Git runs for a work tree, its Git directories, the path shown
+    // in warnings (empty for the scanned repository), and its depth.
+    let mut pending = vec![(repo.to_path_buf(), dirs.clone(), String::new(), 0)];
+    // The scanned repository's work tree and Git directories, resolved;
+    // set once its index lists a gitlink.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut populated = 0;
+    while let Some((dir, dirs, shown, depth)) = pending.pop() {
+        let submodule = depth > 0;
+        let attribute = |failure: NotRun| {
+            if submodule {
+                failure.in_submodule(&shown)
+            } else {
+                failure
+            }
+        };
+        let paths = gitlink_paths(exec, git, &dir, submodule, timeout).map_err(attribute)?;
+        if paths.is_empty() {
+            continue;
+        }
+        let tree =
+            effective_work_tree(exec, git, &dir, submodule, &dirs, timeout).map_err(attribute)?;
+        let tree = if submodule {
+            resolved_inside(&tree, &roots).ok_or_else(|| {
+                NotRun::new("work tree is outside the repository").in_submodule(&shown)
+            })?
+        } else {
+            roots = [&tree, &dirs.git_dir, &dirs.common_dir]
+                .iter()
+                .map(fs::canonicalize)
+                .collect::<Result<_, _>>()
+                .map_err(|error| {
+                    NotRun::new(format!(
+                        "work tree or Git directory cannot be resolved: {}",
+                        strerror(&error)
+                    ))
+                })?;
+            tree
+        };
+        for path in paths {
+            let shown = if submodule {
+                format!("{shown}/{path}")
+            } else {
+                path.clone()
+            };
+            let refuse = |reason: &str| NotRun::new(reason).in_submodule(&shown);
+            let Some(relative) = gitlink_relative_path(&path) else {
+                return Err(refuse("path cannot be checked"));
+            };
+            let checkout = tree.join(relative);
+            // Git checks a submodule only when its `.git` exists.
+            match fs::symlink_metadata(checkout.join(".git")) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(refuse(".git is a symbolic link"));
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(refuse(&strerror(&error))),
+            }
+            populated += 1;
+            if depth + 1 > MAX_SUBMODULE_DEPTH || populated > MAX_SUBMODULES {
+                return Err(refuse("too many submodules to check"));
+            }
+            let Some(sub_dirs) = resolve_git_dirs(&checkout) else {
+                return Err(refuse("git directory cannot be resolved"));
+            };
+            let resolved = [&checkout, &sub_dirs.git_dir, &sub_dirs.common_dir]
+                .map(|path| resolved_inside(path, &roots));
+            let [Some(checkout_id), Some(git_dir_id), Some(_)] = resolved else {
+                return Err(refuse("git directory is outside the repository"));
+            };
+            if !seen.insert((checkout_id, git_dir_id)) {
+                continue;
+            }
+            if repository_may_define_filters(Some(&sub_dirs), system_config_may) {
+                query_filter_drivers(exec, git, &checkout, true, timeout, names)
+                    .map_err(|failure| failure.in_submodule(&shown))?;
+            }
+            if index_may_list_gitlinks(&sub_dirs.git_dir) {
+                pending.push((checkout, sub_dirs, shown, depth + 1));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `-c` arguments that switch off every filter driver configured for a
-/// work tree, so `git status` never runs a repository-defined command
-/// when it re-reads a file whose cached stat data is stale. `Err` holds a
-/// failed result to report instead of running `git status` at all.
+/// work tree and for each populated submodule `git status` would check in
+/// it, so `git status` never runs a repository-defined command when it
+/// re-reads a file whose cached stat data is stale. `Err` holds a failed
+/// result to report instead of running `git status` at all.
 fn filter_driver_overrides(
     exec: &dyn Exec,
     git: &str,
@@ -1298,25 +1758,34 @@ fn filter_driver_overrides(
     system_config_may: bool,
     timeout: f64,
 ) -> Result<Vec<OsString>, CommandResult> {
-    if !repository_may_define_filters(repo, system_config_may) {
-        return Ok(Vec::new());
-    }
-    let mut args: Vec<OsString> = vec![git.into()];
-    args.extend(GIT_READ_ONLY_CONFIG.iter().map(OsString::from));
-    args.extend(["-C".into(), repo.as_os_str().to_os_string()]);
-    args.extend(FILTER_DRIVER_QUERY.iter().map(OsString::from));
-    let result = exec.run(&args, timeout);
-    // `git config --get-regexp` exits 1 when nothing matches.
-    let names = match result.code {
-        0 => filter_driver_names(&result.stdout),
-        1 if strip(&result.stderr).is_empty() => Ok(Vec::new()),
-        _ => Err(format!(
-            "filter driver check failed: {}",
-            strip(&result.stderr)
-        )),
-    };
-    match names {
-        Ok(names) => Ok(names
+    let dirs = resolve_git_dirs(repo);
+    let mut names = Vec::new();
+    let collected = (|| {
+        if repository_may_define_filters(dirs.as_ref(), system_config_may) {
+            query_filter_drivers(exec, git, repo, false, timeout, &mut names)?;
+        }
+        // Fast path: an index without gitlinks costs no query.
+        if dirs
+            .as_ref()
+            .is_none_or(|dirs| index_may_list_gitlinks(&dirs.git_dir))
+        {
+            let Some(dirs) = &dirs else {
+                return Err(NotRun::new("git directory cannot be resolved"));
+            };
+            submodule_filter_drivers(
+                exec,
+                git,
+                repo,
+                dirs,
+                system_config_may,
+                timeout,
+                &mut names,
+            )?;
+        }
+        Ok(())
+    })();
+    match collected {
+        Ok(()) => Ok(names
             .iter()
             .flat_map(|name| {
                 ["clean=", "process=", "required=false"]
@@ -1324,11 +1793,11 @@ fn filter_driver_overrides(
             })
             .flatten()
             .collect()),
-        Err(reason) => Err(CommandResult {
-            code: if result.code == 0 { 1 } else { result.code },
+        Err(failure) => Err(CommandResult {
+            code: failure.code,
             stdout: String::new(),
-            stderr: format!("not run: {reason}"),
-            executable: result.executable,
+            stderr: format!("not run: {}", failure.reason),
+            executable: git.to_string(),
             status: "nonzero".to_string(),
         }),
     }
@@ -1409,9 +1878,11 @@ fn worker_count(jobs: usize) -> usize {
 /// Find Git repositories under the requested roots and collect lightweight
 /// state with read-only `git status --porcelain=v2 --branch` and
 /// `git log -1` (plus `git rev-parse` for bare repositories). Filter
-/// drivers configured for a work tree are switched off for its
-/// `git status`, which adds one `git config` query for a repository whose
-/// configuration mentions `filter` or `include`.
+/// drivers configured for a work tree, and for every populated submodule
+/// its `git status` checks, are switched off for that `git status`. That
+/// adds one `git config` query for a repository whose configuration
+/// mentions `filter` or `include`, and a `git ls-files` query (plus the
+/// queries for each submodule) for one whose index could list a gitlink.
 pub fn collect_repositories(
     exec: &dyn Exec,
     repo_roots: &[String],
@@ -3097,6 +3568,289 @@ mod tests {
         }
     }
 
+    /// Records every command and runs it on the host, like [`System`].
+    struct RecordingSystem(std::sync::Mutex<Vec<Vec<String>>>);
+
+    impl Exec for RecordingSystem {
+        fn resolve(&self, name: &str) -> Option<String> {
+            System.resolve(name)
+        }
+        fn run(&self, args: &[OsString], timeout: f64) -> CommandResult {
+            if let Ok(mut calls) = self.0.lock() {
+                calls.push(lossy(args));
+            }
+            System.run(args, timeout)
+        }
+    }
+
+    #[test]
+    fn scanning_never_runs_filter_drivers_configured_in_submodules() {
+        let Some(git) = real_git() else {
+            eprintln!("skipped: git is not installed");
+            return;
+        };
+        let dir = tmp();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        // Defines `filter.x.clean` in a submodule's own configuration and
+        // assigns it to `file`, whose stale stat data makes `git status`
+        // re-read it through the filter. The driver leaves `marker` and is
+        // named after it, so disabling one driver never covers another. A
+        // conditional driver comes from a file included only for that
+        // Git directory (`includeIf "gitdir:..."`), which a query run
+        // anywhere else would not see.
+        let arm_with = |git_dir: &Path, file: &Path, marker: &Path, conditional: bool| {
+            let name = marker.file_name().unwrap().to_str().unwrap();
+            let section = format!(
+                "[filter \"{name}\"]\n\tclean = \"sh -c 'touch {}; cat'\"\n",
+                marker.display()
+            );
+            let config = git_dir.join("config");
+            let mut text = fs::read(&config).unwrap();
+            if conditional {
+                let included = marker.with_extension("cfg");
+                write(&included, section.as_bytes());
+                text.extend_from_slice(
+                    format!(
+                        "[includeIf \"gitdir:{}\"]\n\tpath = {}\n",
+                        git_dir.display(),
+                        included.display()
+                    )
+                    .as_bytes(),
+                );
+            } else {
+                text.extend_from_slice(section.as_bytes());
+            }
+            write(&config, &text);
+            fs::create_dir_all(git_dir.join("info")).unwrap();
+            write(
+                &git_dir.join("info/attributes"),
+                format!("* filter={name}\n").as_bytes(),
+            );
+            File::options()
+                .write(true)
+                .open(file)
+                .and_then(|file| file.set_modified(old))
+                .unwrap();
+        };
+        let arm =
+            |git_dir: &Path, file: &Path, marker: &Path| arm_with(git_dir, file, marker, false);
+        let make = |path: &Path| {
+            fs::create_dir_all(path).unwrap();
+            git_in(&git, path, &["init", "-q", "-b", "main"]);
+            write(&path.join("f"), b"content\n");
+            git_in(&git, path, &["add", "f"]);
+            git_in(&git, path, &["commit", "-q", "-m", "one"]);
+        };
+        let allow = ["-c", "protocol.file.allow=always"];
+        let submodule = |repo: &Path, args: &[&str]| {
+            let all: Vec<&str> = allow.iter().chain(args).copied().collect();
+            git_in(&git, repo, &all);
+        };
+
+        // Sources: `outer` has a nested submodule `inner`.
+        let sources = root.join("sources");
+        make(&sources.join("inner"));
+        make(&sources.join("outer"));
+        let inner_url = spelling(&sources.join("inner"));
+        let outer_url = spelling(&sources.join("outer"));
+        submodule(
+            &sources.join("outer"),
+            &["submodule", "add", "-q", &inner_url, "inner"],
+        );
+        git_in(
+            &git,
+            &sources.join("outer"),
+            &["commit", "-q", "-m", "inner"],
+        );
+
+        let scanned = root.join("scanned");
+        // 1. A registered submodule with a nested one, both armed.
+        let registered = scanned.join("registered");
+        make(&registered);
+        submodule(
+            &registered,
+            &["submodule", "add", "-q", &outer_url, "outer"],
+        );
+        submodule(
+            &registered,
+            &["submodule", "update", "-q", "--init", "--recursive"],
+        );
+        git_in(&git, &registered, &["commit", "-q", "-m", "outer"]);
+        let modules = registered.join(".git/modules/outer");
+        let ran_outer = root.join("ran-outer");
+        let ran_inner = root.join("ran-inner");
+        arm(&modules, &registered.join("outer/f"), &ran_outer);
+        arm_with(
+            &modules.join("modules/inner"),
+            &registered.join("outer/inner/f"),
+            &ran_inner,
+            true,
+        );
+
+        // 2. A bare gitlink: an embedded repository added without any
+        //    `.gitmodules` entry.
+        let unregistered = scanned.join("unregistered");
+        make(&unregistered);
+        make(&unregistered.join("embedded"));
+        git_in(&git, &unregistered, &["add", "embedded"]);
+        git_in(&git, &unregistered, &["commit", "-q", "-m", "gitlink"]);
+        assert!(!unregistered.join(".gitmodules").exists());
+        let ran_embedded = root.join("ran-embedded");
+        arm(
+            &unregistered.join("embedded/.git"),
+            &unregistered.join("embedded/f"),
+            &ran_embedded,
+        );
+
+        // 3. A submodule whose `.git` file points outside the repository.
+        let escaping = scanned.join("escaping");
+        make(&escaping);
+        make(&escaping.join("esc"));
+        git_in(&git, &escaping, &["add", "esc"]);
+        git_in(&git, &escaping, &["commit", "-q", "-m", "gitlink"]);
+        let elsewhere = root.join("elsewhere.git");
+        fs::rename(escaping.join("esc/.git"), &elsewhere).unwrap();
+        write(
+            &escaping.join("esc/.git"),
+            format!("gitdir: {}\n", elsewhere.display()).as_bytes(),
+        );
+        let ran_escaping = root.join("ran-escaping");
+        arm(&elsewhere, &escaping.join("esc/f"), &ran_escaping);
+
+        // 4. A gitlink kept in the shared file of a split index.
+        let split = scanned.join("split");
+        make(&split);
+        make(&split.join("embedded"));
+        git_in(&git, &split, &["add", "embedded"]);
+        git_in(&git, &split, &["commit", "-q", "-m", "gitlink"]);
+        git_in(&git, &split, &["update-index", "--split-index"]);
+        let ran_split = root.join("ran-split");
+        arm(
+            &split.join("embedded/.git"),
+            &split.join("embedded/f"),
+            &ran_split,
+        );
+
+        // 5. A gitlink whose mode has permission bits, which Git still
+        //    treats as a gitlink. The index trailer is zeroed, as
+        //    `index.skipHash` writes it, so Git accepts the edit.
+        let odd = scanned.join("odd-mode");
+        fs::create_dir_all(&odd).unwrap();
+        git_in(&git, &odd, &["init", "-q", "-b", "main"]);
+        make(&odd.join("embedded"));
+        git_in(&git, &odd, &["add", "embedded"]);
+        git_in(&git, &odd, &["commit", "-q", "-m", "gitlink"]);
+        git_in(&git, &odd, &["config", "index.skipHash", "true"]);
+        let index_path = odd.join(".git/index");
+        let mut index = fs::read(&index_path).unwrap();
+        // The only entry starts after the 12-byte header; its mode is at 24.
+        assert_eq!(index[36..40], 0o160000u32.to_be_bytes());
+        index[36..40].copy_from_slice(&0o160755u32.to_be_bytes());
+        let trailer = index.len() - 20;
+        index[trailer..].fill(0);
+        write(&index_path, &index);
+        let ran_odd = root.join("ran-odd");
+        arm(
+            &odd.join("embedded/.git"),
+            &odd.join("embedded/f"),
+            &ran_odd,
+        );
+
+        // 6. A repository without submodules.
+        let plain = scanned.join("plain");
+        make(&plain);
+
+        // 7. A repository whose `core.worktree` puts its work tree, and
+        //    so its submodule checkouts, outside the scanned directory.
+        let tree = root.join("relocated-tree");
+        make(&tree);
+        submodule(&tree, &["submodule", "add", "-q", &outer_url, "sub"]);
+        git_in(&git, &tree, &["commit", "-q", "-m", "sub"]);
+        let relocated = scanned.join("relocated");
+        fs::create_dir(&relocated).unwrap();
+        fs::rename(tree.join(".git"), relocated.join(".git")).unwrap();
+        let sub_git_dir = relocated.join(".git/modules/sub");
+        write(
+            &tree.join("sub/.git"),
+            format!("gitdir: {}\n", sub_git_dir.display()).as_bytes(),
+        );
+        for (config, work_tree) in [
+            (relocated.join(".git/config"), tree.clone()),
+            (sub_git_dir.join("config"), tree.join("sub")),
+        ] {
+            git_in(
+                &git,
+                &root,
+                &[
+                    "config",
+                    "--file",
+                    config.to_str().unwrap(),
+                    "core.worktree",
+                    work_tree.to_str().unwrap(),
+                ],
+            );
+        }
+        let ran_relocated = root.join("ran-relocated");
+        arm(&sub_git_dir, &tree.join("sub/f"), &ran_relocated);
+
+        let exec = RecordingSystem(std::sync::Mutex::new(Vec::new()));
+        let missing = root.join("no-system-config");
+        let (items, warnings) =
+            collect_repositories_with(&exec, &[spelling(&scanned)], 1, 30.0, &missing);
+        let ran: Vec<&str> = [
+            (&ran_outer, "a registered submodule"),
+            (&ran_inner, "a nested submodule"),
+            (&ran_embedded, "an unregistered gitlink"),
+            (&ran_escaping, "a submodule with an outside git directory"),
+            (&ran_relocated, "a submodule of a relocated work tree"),
+            (&ran_split, "a gitlink in a shared index"),
+            (&ran_odd, "a gitlink with permission bits in its mode"),
+        ]
+        .into_iter()
+        .filter(|(marker, _)| marker.exists())
+        .map(|(_, what)| what)
+        .collect();
+        assert!(ran.is_empty(), "git status ran the filters of {ran:?}");
+        let summary: Vec<(&str, &str, Option<&str>)> = items
+            .iter()
+            .map(|item| {
+                (
+                    item.name.as_str(),
+                    item.status.as_str(),
+                    item.metadata.get("dirty_count"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("escaping", "unknown", None),
+                ("odd-mode", "clean", Some("0")),
+                ("plain", "clean", Some("0")),
+                ("registered", "clean", Some("0")),
+                ("relocated", "clean", Some("0")),
+                ("split", "clean", Some("0")),
+                ("unregistered", "clean", Some("0")),
+            ]
+        );
+        assert_eq!(
+            warnings,
+            [format!(
+                "git status failed for {}: not run: submodule 'esc': git directory is \
+                 outside the repository",
+                escaping.display()
+            )]
+        );
+        // A repository whose index lists no gitlink costs no extra query.
+        let calls = exec.0.into_inner().unwrap();
+        let plain_calls: Vec<&Vec<String>> = calls
+            .iter()
+            .filter(|call| call.iter().any(|arg| Path::new(arg) == plain))
+            .collect();
+        assert_eq!(plain_calls.len(), 2, "{plain_calls:?}");
+    }
+
     #[test]
     fn scanning_never_verifies_signatures_or_fetches_missing_objects() {
         use std::io::Write;
@@ -3374,10 +4128,13 @@ mod tests {
         symlink(root.join("plain"), &link).unwrap();
         assert!(config_may_define_filters(&link));
 
+        let may = |repo: &Path, system_config_may: bool| {
+            repository_may_define_filters(resolve_git_dirs(repo).as_ref(), system_config_may)
+        };
         let plain = root.join("plain-repo");
         fs::create_dir_all(plain.join(".git")).unwrap();
-        assert!(!repository_may_define_filters(&plain, false));
-        assert!(repository_may_define_filters(&plain, true));
+        assert!(!may(&plain, false));
+        assert!(may(&plain, true));
 
         // A linked worktree's `.git` file is followed to the common
         // `config` and its own `config.worktree`, as Git reads them.
@@ -3392,25 +4149,376 @@ mod tests {
             b"gitdir: ../main/.git/worktrees/linked\n",
         );
         assert_eq!(
-            repository_config_files(&linked),
+            resolve_git_dirs(&linked).map(|dirs| dirs.config_files()),
             Some([
                 linked.join("../main/.git/worktrees/linked/../../config"),
                 linked.join("../main/.git/worktrees/linked/config.worktree"),
             ])
         );
-        assert!(!repository_may_define_filters(&linked, false));
+        assert!(!may(&linked, false));
         write(&main.join(".git/config"), b"[filter \"lfs\"]\n");
-        assert!(repository_may_define_filters(&linked, false));
+        assert!(may(&linked, false));
         fs::remove_file(main.join(".git/config")).unwrap();
         write(&admin.join("config.worktree"), b"[include]\n");
-        assert!(repository_may_define_filters(&linked, false));
+        assert!(may(&linked, false));
         // A `.git` file Git itself would reject gets the full query.
         write(
             &linked.join(".git"),
             b"gitdir:../main/.git/worktrees/linked\n",
         );
-        assert_eq!(repository_config_files(&linked), None);
-        assert!(repository_may_define_filters(&linked, false));
+        assert_eq!(
+            resolve_git_dirs(&linked).map(|dirs| dirs.config_files()),
+            None
+        );
+        assert!(may(&linked, false));
+    }
+
+    /// An index file in format `version` for `hash_len`-byte object names
+    /// with `entries` (mode, name), empty `extensions`, and a zero trailer
+    /// (`index.skipHash`). Version 3 entries carry extended flags.
+    fn index_bytes(
+        version: u32,
+        hash_len: usize,
+        entries: &[(u32, &str)],
+        extensions: &[&[u8; 4]],
+    ) -> Vec<u8> {
+        let mut out = b"DIRC".to_vec();
+        out.extend(version.to_be_bytes());
+        out.extend(u32::try_from(entries.len()).unwrap().to_be_bytes());
+        for (mode, name) in entries {
+            let start = out.len();
+            out.extend([0; 24]);
+            out.extend(mode.to_be_bytes());
+            out.extend(vec![0; 12 + hash_len]);
+            let extended = if version == 3 { 0x4000 } else { 0 };
+            out.extend((name.len().min(0x0fff) as u16 | extended).to_be_bytes());
+            if version == 3 {
+                out.extend([0, 0]);
+            }
+            if version == 4 {
+                out.push(0);
+            }
+            out.extend(name.as_bytes());
+            if version == 4 {
+                out.push(0);
+            } else {
+                let length = out.len() - start;
+                out.extend(vec![0; 8 - length % 8]);
+            }
+        }
+        for signature in extensions {
+            out.extend(*signature);
+            out.extend(0u32.to_be_bytes());
+        }
+        out.extend(vec![0; hash_len]);
+        out
+    }
+
+    #[test]
+    fn indexes_that_could_list_gitlinks() {
+        let plain = index_bytes(2, 20, &[(0o100644, "f"), (0o120000, "link")], &[b"TREE"]);
+        let gitlink = index_bytes(2, 20, &[(0o100644, "f"), (0o160000, "sub")], &[]);
+        let dir = tmp();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        // A Git directory holding `files`.
+        let git_dir = |name: &str, files: &[(&str, &[u8])]| {
+            let path = root.join(name);
+            fs::create_dir(&path).unwrap();
+            for (file, content) in files {
+                write(&path.join(file), content);
+            }
+            path
+        };
+        let lists =
+            |name: &str, index: &[u8]| index_may_list_gitlinks(&git_dir(name, &[("index", index)]));
+        assert!(!index_may_list_gitlinks(&git_dir("missing", &[])));
+        assert!(!lists("plain", &plain));
+        assert!(lists("gitlink", &gitlink));
+        // Git tests only the file-type bits of a mode.
+        assert!(lists(
+            "odd-mode",
+            &index_bytes(2, 20, &[(0o160755, "sub")], &[])
+        ));
+        let long = "d/".repeat(3000) + "f";
+        for (version, hash_len) in [(2, 32), (3, 20), (3, 32), (4, 20), (4, 32)] {
+            let what = format!("version {version}, {hash_len}-byte names");
+            let entries = [(0o100644, "f"), (0o100755, long.as_str())];
+            let index = index_bytes(version, hash_len, &entries, &[b"TREE"]);
+            assert!(
+                !lists(&format!("plain-{version}-{hash_len}"), &index),
+                "{what}"
+            );
+            let entries = [(0o100644, long.as_str()), (0o160000, "sub")];
+            let index = index_bytes(version, hash_len, &entries, &[]);
+            assert!(
+                lists(&format!("gitlink-{version}-{hash_len}"), &index),
+                "{what}"
+            );
+        }
+        // A sparse index folds directories into tree entries.
+        assert!(lists(
+            "sparse",
+            &index_bytes(2, 20, &[(0o100644, "f")], &[b"sdir"])
+        ));
+        // A split index is judged by its shared index files.
+        let split = index_bytes(2, 20, &[(0o100644, "f")], &[b"link"]);
+        assert!(!lists("split-alone", &split));
+        assert!(!index_may_list_gitlinks(&git_dir(
+            "split-plain",
+            &[("index", &split), ("sharedindex.0abc", &plain)]
+        )));
+        assert!(index_may_list_gitlinks(&git_dir(
+            "split-gitlink",
+            &[
+                ("index", &split),
+                ("sharedindex.0abc", &plain),
+                ("sharedindex.0def", &gitlink)
+            ]
+        )));
+        // An index that does not fit the format is assumed to list one.
+        assert!(lists("truncated", &plain[..plain.len() - 30]));
+        assert!(lists("not-an-index", b"not an index at all"));
+        let large = vec![b'#'; MAX_INDEX_SCAN_BYTES + 1];
+        assert!(lists("large", &large));
+        let linked = git_dir("symlink", &[]);
+        symlink(root.join("plain/index"), linked.join("index")).unwrap();
+        assert!(index_may_list_gitlinks(&linked));
+    }
+
+    #[test]
+    fn submodules_are_followed_or_the_repository_is_reported() {
+        let gitlink_index = index_bytes(2, 20, &[(0o160000, "sub")], &[]);
+        let dir = tmp();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        // A work tree, optionally with a Git directory configuration and
+        // an index that could list gitlinks.
+        let work_tree = |path: &Path, config: &[u8], gitlinks: bool| {
+            fs::create_dir_all(path.join(".git")).unwrap();
+            write(&path.join(".git/config"), config);
+            if gitlinks {
+                write(&path.join(".git/index"), &gitlink_index);
+            }
+        };
+        let gitlink = |path: &str| format!("100644 0abc 0\tf\0160000 0def 0\t{path}\0");
+        // `git ls-files` answers per directory.
+        let listings: std::collections::HashMap<PathBuf, (i32, String, String)> = [
+            ("unpopulated", gitlink("missing")),
+            ("dotdot", gitlink("../dotdot")),
+            ("symlinked", gitlink("sub")),
+            ("outside", gitlink("sub")),
+            ("nested", gitlink("a")),
+            ("nested/a", gitlink("b")),
+            ("moved", gitlink("sub")),
+            ("moved/sub", gitlink("x")),
+            (
+                "wide",
+                (0..=MAX_SUBMODULES)
+                    .map(|n| gitlink(&format!("s{n}")))
+                    .collect(),
+            ),
+        ]
+        .into_iter()
+        .map(|(path, listing)| (root.join(path), (0, listing, String::new())))
+        .chain((0..=MAX_SUBMODULE_DEPTH).map(|depth| {
+            let path = root.join("deep").join("d/".repeat(depth));
+            (
+                path.components().collect(),
+                (0, gitlink("d"), String::new()),
+            )
+        }))
+        .chain([(
+            root.join("failing"),
+            (
+                128,
+                String::new(),
+                "fatal: index file corrupt\n".to_string(),
+            ),
+        )])
+        .collect();
+        for name in ["unpopulated", "dotdot", "symlinked", "outside", "failing"] {
+            work_tree(&root.join(name), b"[core]\n", true);
+        }
+        fs::create_dir_all(root.join("symlinked/sub")).unwrap();
+        symlink(root.join("elsewhere"), root.join("symlinked/sub/.git")).unwrap();
+        work_tree(&root.join("elsewhere"), b"[core]\n", false);
+        fs::create_dir_all(root.join("outside/sub")).unwrap();
+        write(
+            &root.join("outside/sub/.git"),
+            format!("gitdir: {}\n", root.join("elsewhere/.git").display()).as_bytes(),
+        );
+        // A submodule whose `core.worktree` leads outside.
+        work_tree(&root.join("moved"), b"[core]\n", true);
+        work_tree(&root.join("moved/sub"), b"[core]\n\tworktree = /\n", true);
+        work_tree(&root.join("nested"), b"[filter \"top\"]\n", true);
+        work_tree(&root.join("nested/a"), b"[filter \"a\"]\n", true);
+        work_tree(&root.join("nested/a/b"), b"[include]\n", false);
+        let mut deep = root.join("deep");
+        for _ in 0..=MAX_SUBMODULE_DEPTH + 1 {
+            work_tree(&deep, b"[core]\n", true);
+            deep.push("d");
+        }
+        work_tree(&root.join("wide"), b"[core]\n", true);
+        for n in 0..=MAX_SUBMODULES {
+            fs::create_dir_all(root.join(format!("wide/s{n}/.git"))).unwrap();
+        }
+
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let seen = std::sync::Arc::clone(&log);
+        let root_for_exec = root.clone();
+        let exec = fake(move |args| {
+            seen.lock().unwrap().push(args.to_vec());
+            let dir = args
+                .iter()
+                .position(|a| a == "-C")
+                .map(|i| PathBuf::from(&args[i + 1]))
+                .unwrap();
+            if args.iter().any(|a| a == "ls-files") {
+                let (code, stdout, stderr) = listings.get(&dir).cloned().unwrap_or_default();
+                return CommandResult::new(code, &stdout, &stderr, &args[0]);
+            }
+            if args.iter().any(|a| a == "config") {
+                let name = dir.file_name().unwrap().to_string_lossy();
+                let name = if name == "nested" { "top".into() } else { name };
+                return CommandResult::new(0, &format!("filter.{name}.clean\0"), "", &args[0]);
+            }
+            if args.iter().any(|a| a == "--show-toplevel") {
+                let top = format!("{}\n", root_for_exec.join("elsewhere").display());
+                return CommandResult::new(0, &top, "", &args[0]);
+            }
+            let stdout = if args.iter().any(|a| a == "status") {
+                "# branch.oid 0abc\n# branch.head main\n"
+            } else {
+                ""
+            };
+            CommandResult::new(0, stdout, "", &args[0])
+        });
+        let missing = root.join("no-system-config");
+        let names = [
+            "unpopulated",
+            "dotdot",
+            "symlinked",
+            "outside",
+            "failing",
+            "moved",
+            "nested",
+            "deep",
+            "wide",
+        ];
+        let roots: Vec<String> = names
+            .iter()
+            .map(|name| spelling(&root.join(name)))
+            .collect();
+        let (items, warnings) = collect_repositories_with(&exec, &roots, 0, 1.0, &missing);
+        let status: std::collections::HashMap<&str, &str> = items
+            .iter()
+            .map(|item| (item.name.as_str(), item.status.as_str()))
+            .collect();
+        assert_eq!(status["unpopulated"], "clean");
+        assert_eq!(status["nested"], "clean");
+        let deep_path = format!("{}d", "d/".repeat(MAX_SUBMODULE_DEPTH));
+        let mut expected = vec![
+            (
+                "dotdot",
+                "submodule '../dotdot': path cannot be checked".to_string(),
+            ),
+            (
+                "symlinked",
+                "submodule 'sub': .git is a symbolic link".to_string(),
+            ),
+            (
+                "outside",
+                "submodule 'sub': git directory is outside the repository".to_string(),
+            ),
+            (
+                "failing",
+                "submodule check failed: fatal: index file corrupt".to_string(),
+            ),
+            (
+                "moved",
+                "submodule 'sub': work tree is outside the repository".to_string(),
+            ),
+            (
+                "deep",
+                format!(
+                    "submodule {}: too many submodules to check",
+                    repr_str(&deep_path)
+                ),
+            ),
+            (
+                "wide",
+                format!("submodule 's{MAX_SUBMODULES}': too many submodules to check"),
+            ),
+        ];
+        expected.sort();
+        let mut reported: Vec<(&str, String)> = expected
+            .iter()
+            .map(|(name, _)| {
+                assert_eq!(status[name], "unknown", "{name}");
+                let prefix = format!(
+                    "git status failed for {}: not run: ",
+                    root.join(name).display()
+                );
+                let warning = warnings
+                    .iter()
+                    .find(|warning| warning.starts_with(&prefix))
+                    .unwrap_or_else(|| panic!("{name}: {warnings:?}"));
+                (*name, warning[prefix.len()..].to_string())
+            })
+            .collect();
+        reported.sort();
+        assert_eq!(reported, expected);
+        assert_eq!(warnings.len(), expected.len(), "{warnings:?}");
+
+        // Each call as (directory, arguments after it, whole call).
+        let calls: Vec<(PathBuf, Vec<String>, Vec<String>)> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| {
+                let at = call.iter().position(|a| a == "-C").unwrap();
+                (
+                    PathBuf::from(&call[at + 1]),
+                    call[at + 2..].to_vec(),
+                    call.clone(),
+                )
+            })
+            .collect();
+        let within = |name: &str| -> Vec<&(PathBuf, Vec<String>, Vec<String>)> {
+            calls
+                .iter()
+                .filter(|(dir, _, _)| dir.starts_with(root.join(name)))
+                .collect()
+        };
+        // An unpopulated gitlink is skipped like Git skips it.
+        let unpopulated: Vec<&str> = within("unpopulated")
+            .iter()
+            .map(|(_, rest, _)| rest[0].as_str())
+            .collect();
+        assert_eq!(unpopulated, ["ls-files", "status", "log"]);
+        // Queries inside a submodule run the way `git status` checks it,
+        // and every driver found, at every depth, is disabled.
+        let nested = within("nested");
+        for (dir, rest, _) in &nested {
+            let inside = *dir != root.join("nested");
+            assert_eq!(rest[0] == "--git-dir=.git", inside, "{rest:?}");
+        }
+        let (_, _, status_call) = nested
+            .iter()
+            .find(|(_, rest, _)| rest[0] == "status")
+            .unwrap();
+        for name in ["top", "a", "b"] {
+            assert!(
+                status_call.contains(&format!("filter.{name}.clean=")),
+                "{name}: {status_call:?}"
+            );
+        }
+        // A refused repository never runs `git status`.
+        for (name, _) in &expected {
+            assert!(
+                !within(name).iter().any(|(_, rest, _)| rest[0] == "status"),
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `git status` no longer runs filter drivers configured in a submodule. Git checks each populated submodule by starting `git status` inside it, and that process reads the submodule's own configuration (for example `.git/modules/<name>/config`), so a `clean` filter defined there ran whenever a file's cached stat data was stale, also for a gitlink without any `.gitmodules` entry and for nested submodules. oremap now lists the gitlinks in the index with `git ls-files --stage`, follows each populated submodule's `.git` to its Git directory, recursively, and switches off the drivers configured there with the same `-c filter.<name>.clean=`, `process=` and `required=false` overrides, which Git passes on to every submodule check. The driver query runs inside the submodule the way Git's own check does (`--git-dir=.git`), so conditional includes resolve identically, and a relocated work tree (`core.worktree`) is followed. Gitlinks are recognised by their file-type bits, as Git does, so a crafted mode such as `160755` counts too. A repository whose index lists no gitlink costs no extra `git` call: oremap first reads the entry modes and extensions of the index (and of a split index's shared file) itself, for SHA-1 and SHA-256 layouts, and assumes a gitlink when the file does not fit the format. A submodule whose `.git` is a symbolic link or resolves outside the scanned repository, a gitlink path that is absolute or contains `.` or `..`, more than 8 levels of nesting or 512 populated submodules, or a failed query skips `git status` and records a warning. On the 83 repositories of the reference workspace, reports are unchanged and two repositories with a gitlink add one `git ls-files` call each.
+- A filter driver name containing a line break is reported as one that cannot be disabled, before `git status` runs.
+
 ## 0.4.2 - 2026-10-25
 
 ### Fixed

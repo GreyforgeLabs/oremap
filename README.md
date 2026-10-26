@@ -92,12 +92,17 @@ query the live user manager, and `git` runs with `GIT_OPTIONAL_LOCKS=0` and
 `-c core.fsmonitor=` so `git status` never rewrites a repository index or
 starts a file-system monitor daemon. Filter drivers configured for a
 scanned repository (for example `git lfs`, or a `clean` command in a crafted
-`.git/config`) are switched off for its `git status`. `git log` never checks
-commit signatures, so a repository's `log.showSignature` cannot make it run
-`gpg.program`, and `GIT_NO_LAZY_FETCH=1` stops a partial clone from fetching
-missing objects through its configured remote. Git still checks
-submodule work trees with their own configuration, so point `--repo-root` only
-at repositories you trust. External commands read standard input from
+`.git/config`) are switched off for its `git status`, and so are the drivers
+configured in every populated submodule that `git status` checks, at any
+depth. Submodules are found from the gitlinks in the index, with or without a
+`.gitmodules` entry; a repository whose index lists no gitlink costs no extra
+`git` call. A submodule whose `.git` is a symbolic link or leads outside the
+scanned repository, or more than 8 levels of nesting or 512 submodules, is
+not followed: the repository is reported `unknown` with a warning and its
+`git status` is not run. `git log` never checks commit signatures, so a
+repository's `log.showSignature` cannot make it run `gpg.program`, and
+`GIT_NO_LAZY_FETCH=1` stops a partial clone from fetching missing objects
+through its configured remote. External commands read standard input from
 `/dev/null`. A caller-controlled `PATH` cannot replace `git`, `systemctl`, or
 `crontab`.
 
